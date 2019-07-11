@@ -1,25 +1,23 @@
 ---
 description: |
     The Packer Vagrant Cloud post-processor receives a Vagrant box from the
-    `vagrant` post-processor and pushes it to Vagrant Cloud. Vagrant Cloud hosts and
-    serves boxes to Vagrant, allowing you to version and distribute boxes to an
-    organization in a simple way.
+    `vagrant` post-processor or vagrant builder and pushes it to Vagrant Cloud.
+    Vagrant Cloud hosts and serves boxes to Vagrant, allowing you to version and
+    distribute boxes to an organization in a simple way.
 layout: docs
-page_title: 'Vagrant Cloud Post-Processor'
-...
+page_title: 'Vagrant Cloud - Post-Processors'
+sidebar_current: 'docs-post-processors-vagrant-cloud'
+---
 
 # Vagrant Cloud Post-Processor
-
-\~&gt; Vagrant Cloud has been superseded by Atlas. Please use the [Atlas
-post-processor](/docs/post-processors/atlas.html) instead. Learn more about
-[Atlas](https://atlas.hashicorp.com/).
 
 Type: `vagrant-cloud`
 
 The Packer Vagrant Cloud post-processor receives a Vagrant box from the
-`vagrant` post-processor and pushes it to Vagrant Cloud. [Vagrant
-Cloud](https://atlas.hashicorp.com) hosts and serves boxes to Vagrant, allowing you
-to version and distribute boxes to an organization in a simple way.
+`vagrant` post-processor or vagrant builder and pushes it to Vagrant Cloud.
+[Vagrant Cloud](https://app.vagrantup.com/boxes/search) hosts and serves boxes
+to Vagrant, allowing you to version and distribute boxes to an organization in a
+simple way.
 
 You'll need to be familiar with Vagrant Cloud, have an upgraded account to
 enable box hosting, and be distributing your box via the [shorthand
@@ -56,16 +54,19 @@ on Vagrant Cloud, as well as authentication and version information.
 
 -   `access_token` (string) - Your access token for the Vagrant Cloud API. This
     can be generated on your [tokens
-    page](https://vagrantcloud.com/account/tokens).
+    page](https://app.vagrantup.com/settings/security). If not specified, the
+    environment will be searched. First, `VAGRANT_CLOUD_TOKEN` is checked, and
+    if nothing is found, finally `ATLAS_TOKEN` will be used.
 
 -   `box_tag` (string) - The shorthand tag for your box that maps to Vagrant
-    Cloud, i.e `hashicorp/precise64` for `vagrantcloud.com/hashicorp/precise64`
+    Cloud, for example `hashicorp/precise64`, which is short for
+    `vagrantcloud.com/hashicorp/precise64`.
 
--   `version` (string) - The version number, typically incrementing a
-    previous version. The version string is validated based on [Semantic
+-   `version` (string) - The version number, typically incrementing a previous
+    version. The version string is validated based on [Semantic
     Versioning](http://semver.org/). The string must match a pattern that could
-    be semver, and doesn't validate that the version comes after your
-    previous versions.
+    be semver, and doesn't validate that the version comes after your previous
+    versions.
 
 ### Optional:
 
@@ -73,16 +74,25 @@ on Vagrant Cloud, as well as authentication and version information.
     Vagrant Cloud, making it active. You can manually release the version via
     the API or Web UI. Defaults to false.
 
--   `vagrant_cloud_url` (string) - Override the base URL for Vagrant Cloud. This
-    is useful if you're using Vagrant Private Cloud in your own network.
+-   `vagrant_cloud_url` (string) - Override the base URL for Vagrant Cloud.
+    This is useful if you're using Vagrant Private Cloud in your own network.
     Defaults to `https://vagrantcloud.com/api/v1`
+
+-   `insecure_skip_tls_verify` (boolean) - If set to true *and* `vagrant_cloud_url`
+    is set to something different than its default, it will set TLS InsecureSkipVerify
+    to true. In other words, this will disable security checks of SSL. You may need
+    to set this option to true if your host at vagrant_cloud_url is using a
+    self-signed certificate.
+
+-   `keep_input_artifact` (boolean) - When true, preserve the local box
+    after uploading to Vagrant cloud. Defaults to `true`.
 
 -   `version_description` (string) - Optionally markdown text used as a
     full-length and in-depth description of the version, typically for denoting
     changes introduced
 
--   `box_download_url` (string) - Optional URL for a self-hosted box. If this is
-    set the box will not be uploaded to the Vagrant Cloud.
+-   `box_download_url` (string) - Optional URL for a self-hosted box. If this
+    is set the box will not be uploaded to the Vagrant Cloud.
 
 ## Use with Vagrant Post-Processor
 
@@ -91,15 +101,12 @@ An example configuration is below. Note the use of a doubly-nested array, which
 ensures that the Vagrant Cloud post-processor is run after the Vagrant
 post-processor.
 
-``` {.javascript}
+``` json
 {
   "variables": {
-    "version": "",
-    "cloud_token": ""
+    "cloud_token": "{{ env `ATLAS_TOKEN` }}",
+    "version": "1.0.{{timestamp}}"
   },
-  "builders": [{
-      // ...
-  }],
   "post-processors": [
     [
       {

@@ -1,13 +1,15 @@
 package common
 
 import (
+	"context"
 	"fmt"
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
-	"log"
-	"math/rand"
-	"net"
+
 	"net/http"
+
+	"github.com/hashicorp/packer/common/net"
+	"github.com/hashicorp/packer/helper/common"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 )
 
 // This step creates and runs the HTTP server that is serving files from the
@@ -21,43 +23,38 @@ import (
 //   http_port int - The port the HTTP server started on.
 type StepHTTPServer struct {
 	HTTPDir     string
-	HTTPPortMin uint
-	HTTPPortMax uint
+	HTTPPortMin int
+	HTTPPortMax int
 
-	l net.Listener
+	l *net.Listener
 }
 
-func (s *StepHTTPServer) Run(state multistep.StateBag) multistep.StepAction {
+func (s *StepHTTPServer) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
 	ui := state.Get("ui").(packer.Ui)
 
-	var httpPort uint = 0
 	if s.HTTPDir == "" {
-		state.Put("http_port", httpPort)
+		state.Put("http_port", 0)
 		return multistep.ActionContinue
 	}
 
 	// Find an available TCP port for our HTTP server
 	var httpAddr string
-	portRange := int(s.HTTPPortMax - s.HTTPPortMin)
-	for {
-		var err error
-		var offset uint = 0
+	var err error
+	s.l, err = net.ListenRangeConfig{
+		Min:     s.HTTPPortMin,
+		Max:     s.HTTPPortMax,
+		Addr:    "0.0.0.0",
+		Network: "tcp",
+	}.Listen(ctx)
 
-		if portRange > 0 {
-			// Intn will panic if portRange == 0, so we do a check.
-			offset = uint(rand.Intn(portRange))
-		}
-
-		httpPort = offset + s.HTTPPortMin
-		httpAddr = fmt.Sprintf("0.0.0.0:%d", httpPort)
-		log.Printf("Trying port: %d", httpPort)
-		s.l, err = net.Listen("tcp", httpAddr)
-		if err == nil {
-			break
-		}
+	if err != nil {
+		err := fmt.Errorf("Error finding port: %s", err)
+		state.Put("error", err)
+		ui.Error(err.Error())
+		return multistep.ActionHalt
 	}
 
-	ui.Say(fmt.Sprintf("Starting HTTP server on port %d", httpPort))
+	ui.Say(fmt.Sprintf("Starting HTTP server on port %d", s.l.Port))
 
 	// Start the HTTP server and run it in the background
 	fileServer := http.FileServer(http.Dir(s.HTTPDir))
@@ -65,9 +62,47 @@ func (s *StepHTTPServer) Run(state multistep.StateBag) multistep.StepAction {
 	go server.Serve(s.l)
 
 	// Save the address into the state so it can be accessed in the future
-	state.Put("http_port", httpPort)
+	state.Put("http_port", s.l.Port)
+	SetHTTPPort(fmt.Sprintf("%d", s.l.Port))
 
 	return multistep.ActionContinue
+}
+
+func SetHTTPPort(port string) error {
+	return common.SetSharedState("port", port, "")
+}
+
+func SetHTTPIP(ip string) error {
+	return common.SetSharedState("ip", ip, "")
+}
+
+func GetHTTPAddr() string {
+	ip, err := common.RetrieveSharedState("ip", "")
+	if err != nil {
+		return ""
+	}
+
+	port, err := common.RetrieveSharedState("port", "")
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:%s", ip, port)
+}
+
+func GetHTTPPort() string {
+	port, err := common.RetrieveSharedState("port", "")
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s", port)
+}
+
+func GetHTTPIP() string {
+	ip, err := common.RetrieveSharedState("ip", "")
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s", ip)
 }
 
 func (s *StepHTTPServer) Cleanup(multistep.StateBag) {
@@ -75,4 +110,6 @@ func (s *StepHTTPServer) Cleanup(multistep.StateBag) {
 		// Close the listener so that the HTTP server stops
 		s.l.Close()
 	}
+	common.RemoveSharedStateFile("port", "")
+	common.RemoveSharedStateFile("ip", "")
 }

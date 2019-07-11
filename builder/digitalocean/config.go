@@ -4,15 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/common/uuid"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 	"github.com/mitchellh/mapstructure"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/common/uuid"
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/helper/config"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
 )
 
 type Config struct {
@@ -27,10 +28,16 @@ type Config struct {
 	Image  string `mapstructure:"image"`
 
 	PrivateNetworking bool          `mapstructure:"private_networking"`
+	Monitoring        bool          `mapstructure:"monitoring"`
+	IPv6              bool          `mapstructure:"ipv6"`
 	SnapshotName      string        `mapstructure:"snapshot_name"`
+	SnapshotRegions   []string      `mapstructure:"snapshot_regions"`
 	StateTimeout      time.Duration `mapstructure:"state_timeout"`
+	SnapshotTimeout   time.Duration `mapstructure:"snapshot_timeout"`
 	DropletName       string        `mapstructure:"droplet_name"`
 	UserData          string        `mapstructure:"user_data"`
+	UserDataFile      string        `mapstructure:"user_data_file"`
+	Tags              []string      `mapstructure:"tags"`
 
 	ctx interpolate.Context
 }
@@ -76,16 +83,15 @@ func NewConfig(raws ...interface{}) (*Config, []string, error) {
 		c.DropletName = fmt.Sprintf("packer-%s", uuid.TimeOrderedUUID())
 	}
 
-	if c.Comm.SSHUsername == "" {
-		// Default to "root". You can override this if your
-		// SourceImage has a different user account then the DO default
-		c.Comm.SSHUsername = "root"
-	}
-
 	if c.StateTimeout == 0 {
 		// Default to 6 minute timeouts waiting for
 		// desired state. i.e waiting for droplet to become active
 		c.StateTimeout = 6 * time.Minute
+	}
+
+	if c.SnapshotTimeout == 0 {
+		// Default to 60 minutes timeout, waiting for snapshot action to finish
+		c.SnapshotTimeout = 60 * time.Minute
 	}
 
 	var errs *packer.MultiError
@@ -113,10 +119,31 @@ func NewConfig(raws ...interface{}) (*Config, []string, error) {
 			errs, errors.New("image is required"))
 	}
 
+	if c.UserData != "" && c.UserDataFile != "" {
+		errs = packer.MultiErrorAppend(
+			errs, errors.New("only one of user_data or user_data_file can be specified"))
+	} else if c.UserDataFile != "" {
+		if _, err := os.Stat(c.UserDataFile); err != nil {
+			errs = packer.MultiErrorAppend(
+				errs, errors.New(fmt.Sprintf("user_data_file not found: %s", c.UserDataFile)))
+		}
+	}
+
+	if c.Tags == nil {
+		c.Tags = make([]string, 0)
+	}
+	tagRe := regexp.MustCompile("^[[:alnum:]:_-]{1,255}$")
+
+	for _, t := range c.Tags {
+		if !tagRe.MatchString(t) {
+			errs = packer.MultiErrorAppend(errs, errors.New(fmt.Sprintf("invalid tag: %s", t)))
+		}
+	}
+
 	if errs != nil && len(errs.Errors) > 0 {
 		return nil, nil, errs
 	}
 
-	common.ScrubConfig(c, c.APIToken)
+	packer.LogSecretFilter.Set(c.APIToken)
 	return c, nil, nil
 }

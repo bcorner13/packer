@@ -2,8 +2,6 @@ package docker
 
 import (
 	"fmt"
-	"github.com/mitchellh/iochan"
-	"github.com/mitchellh/packer/packer"
 	"io"
 	"log"
 	"os/exec"
@@ -11,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/hashicorp/packer/common/iochan"
+	"github.com/hashicorp/packer/packer"
 )
 
 func runAndStream(cmd *exec.Cmd, ui packer.Ui) error {
@@ -19,7 +20,18 @@ func runAndStream(cmd *exec.Cmd, ui packer.Ui) error {
 	defer stdout_w.Close()
 	defer stderr_w.Close()
 
-	log.Printf("Executing: %s %v", cmd.Path, cmd.Args[1:])
+	args := make([]string, len(cmd.Args)-1)
+	copy(args, cmd.Args[1:])
+
+	// Scrub password from the log output.
+	for i, v := range args {
+		if v == "-p" || v == "--password" {
+			args[i+1] = "<Filtered>"
+			break
+		}
+	}
+
+	log.Printf("Executing: %s %v", cmd.Path, args)
 	cmd.Stdout = stdout_w
 	cmd.Stderr = stderr_w
 	if err := cmd.Start(); err != nil {
@@ -28,8 +40,8 @@ func runAndStream(cmd *exec.Cmd, ui packer.Ui) error {
 
 	// Create the channels we'll use for data
 	exitCh := make(chan int, 1)
-	stdoutCh := iochan.DelimReader(stdout_r, '\n')
-	stderrCh := iochan.DelimReader(stderr_r, '\n')
+	stdoutCh := iochan.LineReader(stdout_r)
+	stderrCh := iochan.LineReader(stderr_r)
 
 	// Start the goroutine to watch for the exit
 	go func() {

@@ -1,7 +1,8 @@
 //= require jquery
+//= require turbolinks
 
-//= require lib/Base
+//= require hashicorp/mega-nav
+//= require hashicorp/sidebar
+//= require hashicorp/analytics
 
-//= require docs
-//= require app/Sidebar
-////= require app/Init
+//= require analytics

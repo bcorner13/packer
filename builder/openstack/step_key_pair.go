@@ -1,6 +1,7 @@
 package openstack
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -8,39 +9,56 @@ import (
 	"os/exec"
 	"runtime"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common/uuid"
-	"github.com/mitchellh/packer/packer"
-	"github.com/rackspace/gophercloud/openstack/compute/v2/extensions/keypairs"
+	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/keypairs"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/packer/tmp"
 	"golang.org/x/crypto/ssh"
 )
 
 type StepKeyPair struct {
-	Debug          bool
-	DebugKeyPath   string
-	KeyPairName    string
-	PrivateKeyFile string
+	Debug        bool
+	Comm         *communicator.Config
+	DebugKeyPath string
 
-	keyName string
+	doCleanup bool
 }
 
-func (s *StepKeyPair) Run(state multistep.StateBag) multistep.StepAction {
-	if s.PrivateKeyFile != "" {
-		privateKeyBytes, err := ioutil.ReadFile(s.PrivateKeyFile)
+func (s *StepKeyPair) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
+	ui := state.Get("ui").(packer.Ui)
+
+	if s.Comm.SSHPrivateKeyFile != "" {
+		ui.Say("Using existing SSH private key")
+		privateKeyBytes, err := s.Comm.ReadSSHPrivateKeyFile()
 		if err != nil {
-			state.Put("error", fmt.Errorf(
-				"Error loading configured private key file: %s", err))
+			state.Put("error", err)
 			return multistep.ActionHalt
 		}
 
-		state.Put("keyPair", s.KeyPairName)
-		state.Put("privateKey", string(privateKeyBytes))
+		s.Comm.SSHPrivateKey = privateKeyBytes
 
 		return multistep.ActionContinue
 	}
 
-	config := state.Get("config").(Config)
-	ui := state.Get("ui").(packer.Ui)
+	if s.Comm.SSHAgentAuth && s.Comm.SSHKeyPairName == "" {
+		ui.Say("Using SSH Agent with key pair in Source image")
+		return multistep.ActionContinue
+	}
+
+	if s.Comm.SSHAgentAuth && s.Comm.SSHKeyPairName != "" {
+		ui.Say(fmt.Sprintf("Using SSH Agent for existing key pair %s", s.Comm.SSHKeyPairName))
+		s.Comm.SSHKeyPairName = ""
+		return multistep.ActionContinue
+	}
+
+	if s.Comm.SSHTemporaryKeyPairName == "" {
+		ui.Say("Not using temporary keypair")
+		s.Comm.SSHKeyPairName = ""
+		return multistep.ActionContinue
+	}
+
+	config := state.Get("config").(*Config)
 
 	// We need the v2 compute client
 	computeClient, err := config.computeV2Client()
@@ -50,24 +68,23 @@ func (s *StepKeyPair) Run(state multistep.StateBag) multistep.StepAction {
 		return multistep.ActionHalt
 	}
 
-	keyName := fmt.Sprintf("packer %s", uuid.TimeOrderedUUID())
-	ui.Say(fmt.Sprintf("Creating temporary keypair: %s ...", keyName))
+	ui.Say(fmt.Sprintf("Creating temporary keypair: %s ...", s.Comm.SSHTemporaryKeyPairName))
 	keypair, err := keypairs.Create(computeClient, keypairs.CreateOpts{
-		Name: keyName,
+		Name: s.Comm.SSHTemporaryKeyPairName,
 	}).Extract()
 	if err != nil {
 		state.Put("error", fmt.Errorf("Error creating temporary keypair: %s", err))
 		return multistep.ActionHalt
 	}
 
-	if keypair.PrivateKey == "" {
+	if len(keypair.PrivateKey) == 0 {
 		state.Put("error", fmt.Errorf("The temporary keypair returned was blank"))
 		return multistep.ActionHalt
 	}
 
-	ui.Say(fmt.Sprintf("Created temporary keypair: %s", keyName))
+	ui.Say(fmt.Sprintf("Created temporary keypair: %s", s.Comm.SSHTemporaryKeyPairName))
 
-	keypair.PrivateKey = berToDer(keypair.PrivateKey, ui)
+	keypair.PrivateKey = string(berToDer([]byte(keypair.PrivateKey), ui))
 
 	// If we're in debug mode, output the private key to the working
 	// directory.
@@ -95,20 +112,20 @@ func (s *StepKeyPair) Run(state multistep.StateBag) multistep.StepAction {
 		}
 	}
 
-	// Set the keyname so we know to delete it later
-	s.keyName = keyName
+	// we created a temporary key, so remember to clean it up
+	s.doCleanup = true
 
 	// Set some state data for use in future steps
-	state.Put("keyPair", keyName)
-	state.Put("privateKey", keypair.PrivateKey)
+	s.Comm.SSHKeyPairName = s.Comm.SSHTemporaryKeyPairName
+	s.Comm.SSHPrivateKey = []byte(keypair.PrivateKey)
 
 	return multistep.ActionContinue
 }
 
-// Work around for https://github.com/mitchellh/packer/issues/2526
-func berToDer(ber string, ui packer.Ui) string {
+// Work around for https://github.com/hashicorp/packer/issues/2526
+func berToDer(ber []byte, ui packer.Ui) []byte {
 	// Check if x/crypto/ssh can parse the key
-	_, err := ssh.ParsePrivateKey([]byte(ber))
+	_, err := ssh.ParsePrivateKey(ber)
 	if err == nil {
 		return ber
 	}
@@ -121,13 +138,13 @@ func berToDer(ber string, ui packer.Ui) string {
 		return ber
 	}
 
-	berKey, err := ioutil.TempFile("", "packer-ber-privatekey-")
+	berKey, err := tmp.File("packer-ber-privatekey-")
 	defer os.Remove(berKey.Name())
 	if err != nil {
 		return ber
 	}
-	ioutil.WriteFile(berKey.Name(), []byte(ber), os.ModeAppend)
-	derKey, err := ioutil.TempFile("", "packer-der-privatekey-")
+	ioutil.WriteFile(berKey.Name(), ber, os.ModeAppend)
+	derKey, err := tmp.File("packer-der-privatekey-")
 	defer os.Remove(derKey.Name())
 	if err != nil {
 		return ber
@@ -145,35 +162,29 @@ func berToDer(ber string, ui packer.Ui) string {
 		return ber
 	}
 	ui.Say("Successfully converted BER encoded SSH key to DER encoding.")
-	return string(der)
+	return der
 }
 
 func (s *StepKeyPair) Cleanup(state multistep.StateBag) {
-	// If we used an SSH private key file, do not go about deleting
-	// keypairs
-	if s.PrivateKeyFile != "" {
-		return
-	}
-	// If no key name is set, then we never created it, so just return
-	if s.keyName == "" {
+	if !s.doCleanup {
 		return
 	}
 
-	config := state.Get("config").(Config)
+	config := state.Get("config").(*Config)
 	ui := state.Get("ui").(packer.Ui)
 
 	// We need the v2 compute client
 	computeClient, err := config.computeV2Client()
 	if err != nil {
 		ui.Error(fmt.Sprintf(
-			"Error cleaning up keypair. Please delete the key manually: %s", s.keyName))
+			"Error cleaning up keypair. Please delete the key manually: %s", s.Comm.SSHTemporaryKeyPairName))
 		return
 	}
 
-	ui.Say(fmt.Sprintf("Deleting temporary keypair: %s ...", s.keyName))
-	err = keypairs.Delete(computeClient, s.keyName).ExtractErr()
+	ui.Say(fmt.Sprintf("Deleting temporary keypair: %s ...", s.Comm.SSHTemporaryKeyPairName))
+	err = keypairs.Delete(computeClient, s.Comm.SSHTemporaryKeyPairName).ExtractErr()
 	if err != nil {
 		ui.Error(fmt.Sprintf(
-			"Error cleaning up keypair. Please delete the key manually: %s", s.keyName))
+			"Error cleaning up keypair. Please delete the key manually: %s", s.Comm.SSHTemporaryKeyPairName))
 	}
 }

@@ -1,13 +1,14 @@
 package artifice
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/helper/config"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 // The artifact-override post-processor allows you to specify arbitrary files as
@@ -48,7 +49,7 @@ func (p *PostProcessor) Configure(raws ...interface{}) error {
 	return nil
 }
 
-func (p *PostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact) (packer.Artifact, bool, error) {
+func (p *PostProcessor) PostProcess(ctx context.Context, ui packer.Ui, artifact packer.Artifact) (packer.Artifact, bool, bool, error) {
 	if len(artifact.Files()) > 0 {
 		ui.Say(fmt.Sprintf("Discarding artifact files: %s", strings.Join(artifact.Files(), ", ")))
 	}
@@ -56,5 +57,5 @@ func (p *PostProcessor) PostProcess(ui packer.Ui, artifact packer.Artifact) (pac
 	artifact, err := NewArtifact(p.config.Files)
 	ui.Say(fmt.Sprintf("Using these artifact files: %s", strings.Join(artifact.Files(), ", ")))
 
-	return artifact, true, err
+	return artifact, true, false, err
 }

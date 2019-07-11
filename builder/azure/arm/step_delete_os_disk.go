@@ -1,24 +1,24 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License. See the LICENSE file in builder/azure for license information.
-
 package arm
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
-	"github.com/mitchellh/packer/builder/azure/common/constants"
+	"github.com/hashicorp/packer/builder/azure/common/constants"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 )
 
 type StepDeleteOSDisk struct {
-	client *AzureClient
-	delete func(string, string) error
-	say    func(message string)
-	error  func(e error)
+	client        *AzureClient
+	delete        func(string, string) error
+	deleteManaged func(context.Context, string, string) error
+	say           func(message string)
+	error         func(e error)
 }
 
 func NewStepDeleteOSDisk(client *AzureClient, ui packer.Ui) *StepDeleteOSDisk {
@@ -29,38 +29,70 @@ func NewStepDeleteOSDisk(client *AzureClient, ui packer.Ui) *StepDeleteOSDisk {
 	}
 
 	step.delete = step.deleteBlob
+	step.deleteManaged = step.deleteManagedDisk
 	return step
 }
 
 func (s *StepDeleteOSDisk) deleteBlob(storageContainerName string, blobName string) error {
-	return s.client.BlobStorageClient.DeleteBlob(storageContainerName, blobName)
+	blob := s.client.BlobStorageClient.GetContainerReference(storageContainerName).GetBlobReference(blobName)
+	err := blob.Delete(nil)
+
+	if err != nil {
+		s.say(s.client.LastError.Error())
+	}
+	return err
 }
 
-func (s *StepDeleteOSDisk) Run(state multistep.StateBag) multistep.StepAction {
+func (s *StepDeleteOSDisk) deleteManagedDisk(ctx context.Context, resourceGroupName string, imageName string) error {
+	xs := strings.Split(imageName, "/")
+	diskName := xs[len(xs)-1]
+	f, err := s.client.DisksClient.Delete(ctx, resourceGroupName, diskName)
+	if err == nil {
+		err = f.WaitForCompletionRef(ctx, s.client.DisksClient.Client)
+	}
+	return err
+}
+
+func (s *StepDeleteOSDisk) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
 	s.say("Deleting the temporary OS disk ...")
 
 	var osDisk = state.Get(constants.ArmOSDiskVhd).(string)
-	s.say(fmt.Sprintf(" -> OS Disk             : '%s'", osDisk))
+	var isManagedDisk = state.Get(constants.ArmIsManagedImage).(bool)
+	var isExistingResourceGroup = state.Get(constants.ArmIsExistingResourceGroup).(bool)
+	var resourceGroupName = state.Get(constants.ArmResourceGroupName).(string)
 
+	if isManagedDisk && !isExistingResourceGroup {
+		s.say(fmt.Sprintf(" -> OS Disk : skipping, managed disk was used..."))
+		return multistep.ActionContinue
+	}
+
+	s.say(fmt.Sprintf(" -> OS Disk : '%s'", osDisk))
+
+	var err error
+	if isManagedDisk {
+		err = s.deleteManaged(ctx, resourceGroupName, osDisk)
+		if err != nil {
+			s.say("Failed to delete the managed OS Disk!")
+			return processStepResult(err, s.error, state)
+		}
+		return multistep.ActionContinue
+	}
 	u, err := url.Parse(osDisk)
 	if err != nil {
 		s.say("Failed to parse the OS Disk's VHD URI!")
-		return multistep.ActionHalt
+		return processStepResult(err, s.error, state)
 	}
 
 	xs := strings.Split(u.Path, "/")
+	if len(xs) < 3 {
+		err = errors.New("Failed to parse OS Disk's VHD URI!")
+	} else {
+		var storageAccountName = xs[1]
+		var blobName = strings.Join(xs[2:], "/")
 
-	var storageAccountName = xs[1]
-	var blobName = strings.Join(xs[2:], "/")
-
-	err = s.delete(storageAccountName, blobName)
-	if err != nil {
-		state.Put(constants.Error, err)
-		s.error(err)
-
-		return multistep.ActionHalt
+		err = s.delete(storageAccountName, blobName)
 	}
-	return multistep.ActionContinue
+	return processStepResult(err, s.error, state)
 }
 
 func (*StepDeleteOSDisk) Cleanup(multistep.StateBag) {

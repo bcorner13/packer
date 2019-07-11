@@ -1,19 +1,17 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License. See the LICENSE file in builder/azure for license information.
-
 package arm
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/builder/azure/common/constants"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/builder/azure/common/constants"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 )
 
 type StepPowerOffCompute struct {
 	client   *AzureClient
-	powerOff func(resourceGroupName string, computeName string) error
+	powerOff func(ctx context.Context, resourceGroupName string, computeName string) error
 	say      func(message string)
 	error    func(e error)
 }
@@ -29,17 +27,18 @@ func NewStepPowerOffCompute(client *AzureClient, ui packer.Ui) *StepPowerOffComp
 	return step
 }
 
-func (s *StepPowerOffCompute) powerOffCompute(resourceGroupName string, computeName string) error {
-	res, err := s.client.PowerOff(resourceGroupName, computeName)
-	if err != nil {
-		return err
+func (s *StepPowerOffCompute) powerOffCompute(ctx context.Context, resourceGroupName string, computeName string) error {
+	f, err := s.client.VirtualMachinesClient.Deallocate(ctx, resourceGroupName, computeName)
+	if err == nil {
+		err = f.WaitForCompletionRef(ctx, s.client.VirtualMachinesClient.Client)
 	}
-
-	s.client.VirtualMachinesClient.PollAsNeeded(res.Response)
-	return nil
+	if err != nil {
+		s.say(s.client.LastError.Error())
+	}
+	return err
 }
 
-func (s *StepPowerOffCompute) Run(state multistep.StateBag) multistep.StepAction {
+func (s *StepPowerOffCompute) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
 	s.say("Powering off machine ...")
 
 	var resourceGroupName = state.Get(constants.ArmResourceGroupName).(string)
@@ -48,15 +47,9 @@ func (s *StepPowerOffCompute) Run(state multistep.StateBag) multistep.StepAction
 	s.say(fmt.Sprintf(" -> ResourceGroupName : '%s'", resourceGroupName))
 	s.say(fmt.Sprintf(" -> ComputeName       : '%s'", computeName))
 
-	err := s.powerOff(resourceGroupName, computeName)
-	if err != nil {
-		state.Put(constants.Error, err)
-		s.error(err)
+	err := s.powerOff(ctx, resourceGroupName, computeName)
 
-		return multistep.ActionHalt
-	}
-
-	return multistep.ActionContinue
+	return processStepResult(err, s.error, state)
 }
 
 func (*StepPowerOffCompute) Cleanup(multistep.StateBag) {

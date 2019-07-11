@@ -4,15 +4,15 @@ import (
 	"errors"
 	"time"
 
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 type SSHConfig struct {
 	Comm communicator.Config `mapstructure:",squash"`
 
-	SSHHostPortMin    uint `mapstructure:"ssh_host_port_min"`
-	SSHHostPortMax    uint `mapstructure:"ssh_host_port_max"`
+	SSHHostPortMin    int  `mapstructure:"ssh_host_port_min"`
+	SSHHostPortMax    int  `mapstructure:"ssh_host_port_max"`
 	SSHSkipNatMapping bool `mapstructure:"ssh_skip_nat_mapping"`
 
 	// These are deprecated, but we keep them around for BC
@@ -21,6 +21,10 @@ type SSHConfig struct {
 }
 
 func (c *SSHConfig) Prepare(ctx *interpolate.Context) []error {
+	if c.Comm.SSHHost == "" {
+		c.Comm.SSHHost = "127.0.0.1"
+	}
+
 	if c.SSHHostPortMin == 0 {
 		c.SSHHostPortMin = 2222
 	}

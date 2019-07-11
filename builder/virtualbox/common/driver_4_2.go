@@ -2,12 +2,17 @@ package common
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+
+	versionUtil "github.com/hashicorp/go-version"
+	"github.com/hashicorp/packer/common/retry"
 )
 
 type VBox42Driver struct {
@@ -15,22 +20,32 @@ type VBox42Driver struct {
 	VBoxManagePath string
 }
 
-func (d *VBox42Driver) CreateSATAController(vmName string, name string) error {
+func (d *VBox42Driver) CreateSATAController(vmName string, name string, portcount int) error {
 	version, err := d.Version()
 	if err != nil {
 		return err
 	}
 
-	portCountArg := "--sataportcount"
-	if strings.HasPrefix(version, "4.3") || strings.HasPrefix(version, "5.") {
-		portCountArg = "--portcount"
+	portCountArg := "--portcount"
+
+	currentVersion, err := versionUtil.NewVersion(version)
+	if err != nil {
+		return err
+	}
+	firstVersionUsingPortCount, err := versionUtil.NewVersion("4.3")
+	if err != nil {
+		return err
+	}
+
+	if currentVersion.LessThan(firstVersionUsingPortCount) {
+		portCountArg = "--sataportcount"
 	}
 
 	command := []string{
 		"storagectl", vmName,
 		"--name", name,
 		"--add", "sata",
-		portCountArg, "1",
+		portCountArg, strconv.Itoa(portcount),
 	}
 
 	return d.VBoxManage(command...)
@@ -49,7 +64,14 @@ func (d *VBox42Driver) CreateSCSIController(vmName string, name string) error {
 }
 
 func (d *VBox42Driver) Delete(name string) error {
-	return d.VBoxManage("unregistervm", name, "--delete")
+	ctx := context.TODO()
+	return retry.Config{
+		Tries:      5,
+		RetryDelay: (&retry.Backoff{InitialBackoff: 1 * time.Second, MaxBackoff: 1 * time.Second, Multiplier: 2}).Linear,
+	}.Run(ctx, func(ctx context.Context) error {
+		err := d.VBoxManage("unregistervm", name, "--delete")
+		return err
+	})
 }
 
 func (d *VBox42Driver) Iso() (string, error) {

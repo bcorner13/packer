@@ -1,35 +1,59 @@
 package autorest
 
+// Copyright 2017 Microsoft Corporation
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+
 import (
 	"bytes"
+	"crypto/tls"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
+	"strings"
 	"time"
+
+	"github.com/Azure/go-autorest/logger"
+	"github.com/Azure/go-autorest/tracing"
 )
 
 const (
-	// DefaultPollingDelay is the default delay between polling requests (only used if the
-	// http.Request lacks a well-formed Retry-After header).
+	// DefaultPollingDelay is a reasonable delay between polling requests.
 	DefaultPollingDelay = 60 * time.Second
 
-	// DefaultPollingDuration is the default total polling duration.
+	// DefaultPollingDuration is a reasonable total polling duration.
 	DefaultPollingDuration = 15 * time.Minute
+
+	// DefaultRetryAttempts is number of attempts for retry status codes (5xx).
+	DefaultRetryAttempts = 3
+
+	// DefaultRetryDuration is the duration to wait between retries.
+	DefaultRetryDuration = 30 * time.Second
 )
 
-// PollingMode sets how, if at all, clients composed with Client will poll.
-type PollingMode string
-
-const (
-	// PollUntilAttempts polling mode polls until reaching a maximum number of attempts.
-	PollUntilAttempts PollingMode = "poll-until-attempts"
-
-	// PollUntilDuration polling mode polls until a specified time.Duration has passed.
-	PollUntilDuration PollingMode = "poll-until-duration"
-
-	// DoNotPoll disables polling.
-	DoNotPoll PollingMode = "not-at-all"
+var (
+	// StatusCodesForRetry are a defined group of status code for which the client will retry
+	StatusCodesForRetry = []int{
+		http.StatusRequestTimeout,      // 408
+		http.StatusTooManyRequests,     // 429
+		http.StatusInternalServerError, // 500
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable,  // 503
+		http.StatusGatewayTimeout,      // 504
+	}
 )
 
 const (
@@ -42,6 +66,12 @@ const (
 ===================================================== HTTP Response End
 `
 )
+
+// Response serves as the base for all responses from generated clients. It provides access to the
+// last http.Response.
+type Response struct {
+	*http.Response `json:"-"`
+}
 
 // LoggingInspector implements request and response inspectors that log the full request and
 // response to a supplied log.
@@ -62,7 +92,9 @@ func (li LoggingInspector) WithInspection() PrepareDecorator {
 			defer r.Body.Close()
 
 			r.Body = ioutil.NopCloser(io.TeeReader(r.Body, &body))
-			r.Write(&b)
+			if err := r.Write(&b); err != nil {
+				return nil, fmt.Errorf("Failed to write response: %v", err)
+			}
 
 			li.Logger.Printf(requestFormat, b.String())
 
@@ -81,11 +113,11 @@ func (li LoggingInspector) ByInspecting() RespondDecorator {
 	return func(r Responder) Responder {
 		return ResponderFunc(func(resp *http.Response) error {
 			var body, b bytes.Buffer
-
 			defer resp.Body.Close()
-
 			resp.Body = ioutil.NopCloser(io.TeeReader(resp.Body, &body))
-			resp.Write(&b)
+			if err := resp.Write(&b); err != nil {
+				return fmt.Errorf("Failed to write response: %v", err)
+			}
 
 			li.Logger.Printf(responseFormat, b.String())
 
@@ -95,17 +127,9 @@ func (li LoggingInspector) ByInspecting() RespondDecorator {
 	}
 }
 
-var (
-	// DefaultClient is the base from which generated clients should create a Client instance. Users
-	// can then established widely used Client defaults by replacing or modifying the DefaultClient
-	// before instantiating a generated client.
-	DefaultClient = Client{PollingMode: PollUntilDuration, PollingDuration: DefaultPollingDuration}
-)
-
 // Client is the base for autorest generated clients. It provides default, "do nothing"
 // implementations of an Authorizer, RequestInspector, and ResponseInspector. It also returns the
-// standard, undecorated http.Client as a default Sender. Lastly, it supports basic request polling,
-// limited to a maximum number of attempts or a specified duration.
+// standard, undecorated http.Client as a default Sender.
 //
 // Generated clients should also use Error (see NewError and NewErrorWithError) for errors and
 // return responses that compose with Response.
@@ -120,115 +144,134 @@ type Client struct {
 	RequestInspector  PrepareDecorator
 	ResponseInspector RespondDecorator
 
-	PollingMode     PollingMode
-	PollingAttempts int
+	// PollingDelay sets the polling frequency used in absence of a Retry-After HTTP header
+	PollingDelay time.Duration
+
+	// PollingDuration sets the maximum polling time after which an error is returned.
+	// Setting this to zero will use the provided context to control the duration.
 	PollingDuration time.Duration
+
+	// RetryAttempts sets the default number of retry attempts for client.
+	RetryAttempts int
+
+	// RetryDuration sets the delay duration for retries.
+	RetryDuration time.Duration
 
 	// UserAgent, if not empty, will be set as the HTTP User-Agent header on all requests sent
 	// through the Do method.
 	UserAgent string
+
+	Jar http.CookieJar
+
+	// Set to true to skip attempted registration of resource providers (false by default).
+	SkipResourceProviderRegistration bool
 }
 
-// NewClientWithUserAgent returns an instance of the DefaultClient with the UserAgent set to the
-// passed string.
+// NewClientWithUserAgent returns an instance of a Client with the UserAgent set to the passed
+// string.
 func NewClientWithUserAgent(ua string) Client {
-	c := DefaultClient
-	c.UserAgent = ua
+	return newClient(ua, tls.RenegotiateNever)
+}
+
+// ClientOptions contains various Client configuration options.
+type ClientOptions struct {
+	// UserAgent is an optional user-agent string to append to the default user agent.
+	UserAgent string
+
+	// Renegotiation is an optional setting to control client-side TLS renegotiation.
+	Renegotiation tls.RenegotiationSupport
+}
+
+// NewClientWithOptions returns an instance of a Client with the specified values.
+func NewClientWithOptions(options ClientOptions) Client {
+	return newClient(options.UserAgent, options.Renegotiation)
+}
+
+func newClient(ua string, renegotiation tls.RenegotiationSupport) Client {
+	c := Client{
+		PollingDelay:    DefaultPollingDelay,
+		PollingDuration: DefaultPollingDuration,
+		RetryAttempts:   DefaultRetryAttempts,
+		RetryDuration:   DefaultRetryDuration,
+		UserAgent:       UserAgent(),
+	}
+	c.Sender = c.sender(renegotiation)
+	c.AddToUserAgent(ua)
 	return c
 }
 
-// IsPollingAllowed returns an error if the client allows polling and the passed http.Response
-// requires it, otherwise it returns nil.
-func (c Client) IsPollingAllowed(resp *http.Response, codes ...int) error {
-	if c.DoNotPoll() && ResponseRequiresPolling(resp, codes...) {
-		return NewErrorWithResponse("autorest/Client", "IsPollingAllowed", resp, "Response to %s requires polling but polling is disabled",
-			resp.Request.URL)
+// AddToUserAgent adds an extension to the current user agent
+func (c *Client) AddToUserAgent(extension string) error {
+	if extension != "" {
+		c.UserAgent = fmt.Sprintf("%s %s", c.UserAgent, extension)
+		return nil
 	}
-	return nil
+	return fmt.Errorf("Extension was empty, User Agent stayed as %s", c.UserAgent)
 }
 
-// PollAsNeeded is a convenience method that will poll if the passed http.Response requires it.
-func (c Client) PollAsNeeded(resp *http.Response, codes ...int) (*http.Response, error) {
-	if !ResponseRequiresPolling(resp, codes...) {
-		return resp, nil
+// Do implements the Sender interface by invoking the active Sender after applying authorization.
+// If Sender is not set, it uses a new instance of http.Client. In both cases it will, if UserAgent
+// is set, apply set the User-Agent header.
+func (c Client) Do(r *http.Request) (*http.Response, error) {
+	if r.UserAgent() == "" {
+		r, _ = Prepare(r,
+			WithUserAgent(c.UserAgent))
 	}
-
-	if c.DoNotPoll() {
-		return resp, NewErrorWithResponse("autorest/Client", "PollAsNeeded", resp, "Polling for %s is required, but polling is disabled",
-			resp.Request.URL)
-	}
-
-	req, err := NewPollingRequest(resp, c)
-	if err != nil {
-		return resp, NewErrorWithError(err, "autorest/Client", "PollAsNeeded", resp, "Unable to create polling request for response to %s",
-			resp.Request.URL)
-	}
-
-	Prepare(req,
+	// NOTE: c.WithInspection() must be last in the list so that it can inspect all preceding operations
+	r, err := Prepare(r,
+		c.WithAuthorization(),
 		c.WithInspection())
-
-	if c.PollForAttempts() {
-		return PollForAttempts(c, req, DefaultPollingDelay, c.PollingAttempts, codes...)
-	}
-	return PollForDuration(c, req, DefaultPollingDelay, c.PollingDuration, codes...)
-}
-
-// DoNotPoll returns true if the client should not poll, false otherwise.
-func (c Client) DoNotPoll() bool {
-	return len(c.PollingMode) == 0 || c.PollingMode == DoNotPoll
-}
-
-// PollForAttempts returns true if the PollingMode is set to ForAttempts, false otherwise.
-func (c Client) PollForAttempts() bool {
-	return c.PollingMode == PollUntilAttempts
-}
-
-// PollForDuration return true if the PollingMode is set to ForDuration, false otherwise.
-func (c Client) PollForDuration() bool {
-	return c.PollingMode == PollUntilDuration
-}
-
-// Send sends the passed http.Request after applying authorization. It will poll if the client
-// allows polling and the http.Response status code requires it. It will close the http.Response
-// Body if the request returns an error.
-func (c Client) Send(req *http.Request) (*http.Response, error) {
-	resp, err := SendWithSender(c, req)
-	if err == nil {
-		err = c.IsPollingAllowed(resp)
-		if err == nil {
-			resp, err = c.PollAsNeeded(resp)
-		}
-	}
-
 	if err != nil {
-		Respond(resp,
-			ByClosing())
+		var resp *http.Response
+		if detErr, ok := err.(DetailedError); ok {
+			// if the authorization failed (e.g. invalid credentials) there will
+			// be a response associated with the error, be sure to return it.
+			resp = detErr.Response
+		}
+		return resp, NewErrorWithError(err, "autorest/Client", "Do", nil, "Preparing request failed")
 	}
-
+	logger.Instance.WriteRequest(r, logger.Filter{
+		Header: func(k string, v []string) (bool, []string) {
+			// remove the auth token from the log
+			if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Ocp-Apim-Subscription-Key") {
+				v = []string{"**REDACTED**"}
+			}
+			return true, v
+		},
+	})
+	resp, err := SendWithSender(c.sender(tls.RenegotiateNever), r)
+	logger.Instance.WriteResponse(resp, logger.Filter{})
+	Respond(resp, c.ByInspecting())
 	return resp, err
 }
 
-// Do implements the Sender interface by invoking the active Sender. If Sender is not set, it uses
-// a new instance of http.Client. In both cases it will, if UserAgent is set, apply set the
-// User-Agent header.
-func (c Client) Do(r *http.Request) (*http.Response, error) {
-	if len(c.UserAgent) > 0 {
-		r, _ = Prepare(r, WithUserAgent(c.UserAgent))
-	}
-	r, err := Prepare(r,
-		c.WithInspection(),
-		c.WithAuthorization())
-	if err != nil {
-		return nil, NewErrorWithError(err, "autorest/Client", "Do", nil, "Preparing request failed")
-	}
-	return c.sender().Do(r)
-}
-
 // sender returns the Sender to which to send requests.
-func (c Client) sender() Sender {
+func (c Client) sender(renengotiation tls.RenegotiationSupport) Sender {
 	if c.Sender == nil {
-		return http.DefaultClient
+		// Use behaviour compatible with DefaultTransport, but require TLS minimum version.
+		var defaultTransport = http.DefaultTransport.(*http.Transport)
+		transport := tracing.Transport
+		// for non-default values of TLS renegotiation create a new tracing transport.
+		// updating tracing.Transport affects all clients which is not what we want.
+		if renengotiation != tls.RenegotiateNever {
+			transport = tracing.NewTransport()
+		}
+		transport.Base = &http.Transport{
+			Proxy:                 defaultTransport.Proxy,
+			DialContext:           defaultTransport.DialContext,
+			MaxIdleConns:          defaultTransport.MaxIdleConns,
+			IdleConnTimeout:       defaultTransport.IdleConnTimeout,
+			TLSHandshakeTimeout:   defaultTransport.TLSHandshakeTimeout,
+			ExpectContinueTimeout: defaultTransport.ExpectContinueTimeout,
+			TLSClientConfig: &tls.Config{
+				MinVersion:    tls.VersionTLS12,
+				Renegotiation: renengotiation,
+			},
+		}
+		j, _ := cookiejar.New(nil)
+		return &http.Client{Jar: j, Transport: transport}
 	}
+
 	return c.Sender
 }
 
@@ -262,21 +305,4 @@ func (c Client) ByInspecting() RespondDecorator {
 		return ByIgnoring()
 	}
 	return c.ResponseInspector
-}
-
-// Response serves as the base for all responses from generated clients. It provides access to the
-// last http.Response.
-type Response struct {
-	*http.Response `json:"-"`
-}
-
-// GetPollingDelay extracts the polling delay from the Retry-After header of the response. If
-// the header is absent or is malformed, it will return the supplied default delay time.Duration.
-func (r Response) GetPollingDelay(defaultDelay time.Duration) time.Duration {
-	return GetPollingDelay(r.Response, defaultDelay)
-}
-
-// GetPollingLocation retrieves the polling URL from the Location header of the response.
-func (r Response) GetPollingLocation() string {
-	return GetPollingLocation(r.Response)
 }

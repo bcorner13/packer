@@ -1,14 +1,11 @@
 package main
 
 import (
-	"os"
-	"os/signal"
-
+	"github.com/hashicorp/packer/command"
 	"github.com/mitchellh/cli"
-	"github.com/mitchellh/packer/command"
 )
 
-// Commands is the mapping of all the available Terraform commands.
+// Commands is the mapping of all the available Packer commands.
 var Commands map[string]cli.CommandFactory
 
 // CommandMeta is the Meta to use for the commands. This must be written
@@ -25,6 +22,11 @@ func init() {
 				Meta: *CommandMeta,
 			}, nil
 		},
+		"console": func() (cli.Command, error) {
+			return &command.ConsoleCommand{
+				Meta: *CommandMeta,
+			}, nil
+		},
 
 		"fix": func() (cli.Command, error) {
 			return &command.FixCommand{
@@ -38,12 +40,6 @@ func init() {
 			}, nil
 		},
 
-		"push": func() (cli.Command, error) {
-			return &command.PushCommand{
-				Meta: *CommandMeta,
-			}, nil
-		},
-
 		"validate": func() (cli.Command, error) {
 			return &command.ValidateCommand{
 				Meta: *CommandMeta,
@@ -52,11 +48,8 @@ func init() {
 
 		"version": func() (cli.Command, error) {
 			return &command.VersionCommand{
-				Meta:              *CommandMeta,
-				Revision:          GitCommit,
-				Version:           Version,
-				VersionPrerelease: VersionPrerelease,
-				CheckFunc:         commandVersionCheck,
+				Meta:      *CommandMeta,
+				CheckFunc: commandVersionCheck,
 			}, nil
 		},
 
@@ -66,21 +59,4 @@ func init() {
 			}, nil
 		},
 	}
-}
-
-// makeShutdownCh creates an interrupt listener and returns a channel.
-// A message will be sent on the channel for every interrupt received.
-func makeShutdownCh() <-chan struct{} {
-	resultCh := make(chan struct{})
-
-	signalCh := make(chan os.Signal, 4)
-	signal.Notify(signalCh, os.Interrupt)
-	go func() {
-		for {
-			<-signalCh
-			resultCh <- struct{}{}
-		}
-	}()
-
-	return resultCh
 }

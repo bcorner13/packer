@@ -4,12 +4,13 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"testing"
 	"time"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -132,6 +133,7 @@ func TestNew_Invalid(t *testing.T) {
 		Auth: []ssh.AuthMethod{
 			ssh.Password("i-am-invalid"),
 		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
 	address := newMockLineServer(t)
@@ -160,6 +162,7 @@ func TestStart(t *testing.T) {
 		Auth: []ssh.AuthMethod{
 			ssh.Password("pass"),
 		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
 	address := newMockLineServer(t)
@@ -186,7 +189,8 @@ func TestStart(t *testing.T) {
 		Stdout:  new(bytes.Buffer),
 	}
 
-	client.Start(cmd)
+	ctx := context.Background()
+	client.Start(ctx, cmd)
 }
 
 func TestHandshakeTimeout(t *testing.T) {
@@ -195,6 +199,7 @@ func TestHandshakeTimeout(t *testing.T) {
 		Auth: []ssh.AuthMethod{
 			ssh.Password("pass"),
 		},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
 	address := newMockBrokenServer(t)

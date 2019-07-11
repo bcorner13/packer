@@ -4,15 +4,15 @@
 package openstack
 
 import (
+	"context"
 	"fmt"
-	"log"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/helper/config"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 // The unique ID for this builder
@@ -52,80 +52,112 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 		return nil, errs
 	}
 
-	log.Println(common.ScrubConfig(b.config, b.config.Password))
+	if b.config.ImageConfig.ImageDiskFormat != "" && !b.config.RunConfig.UseBlockStorageVolume {
+		return nil, fmt.Errorf("use_blockstorage_volume must be true if image_disk_format is specified.")
+	}
+
+	// By default, instance name is same as image name
+	if b.config.InstanceName == "" {
+		b.config.InstanceName = b.config.ImageName
+	}
+
+	packer.LogSecretFilter.Set(b.config.Password)
 	return nil, nil
 }
 
-func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packer.Artifact, error) {
+func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (packer.Artifact, error) {
 	computeClient, err := b.config.computeV2Client()
 	if err != nil {
 		return nil, fmt.Errorf("Error initializing compute client: %s", err)
 	}
 
+	imageClient, err := b.config.imageV2Client()
+	if err != nil {
+		return nil, fmt.Errorf("Error initializing image client: %s", err)
+	}
+
 	// Setup the state bag and initial state for the steps
 	state := new(multistep.BasicStateBag)
-	state.Put("config", b.config)
+	state.Put("config", &b.config)
 	state.Put("hook", hook)
 	state.Put("ui", ui)
 
 	// Build the steps
 	steps := []multistep.Step{
-		&StepLoadExtensions{},
 		&StepLoadFlavor{
 			Flavor: b.config.Flavor,
 		},
 		&StepKeyPair{
-			Debug:          b.config.PackerDebug,
-			DebugKeyPath:   fmt.Sprintf("os_%s.pem", b.config.PackerBuildName),
-			KeyPairName:    b.config.SSHKeyPairName,
-			PrivateKeyFile: b.config.RunConfig.Comm.SSHPrivateKey,
+			Debug:        b.config.PackerDebug,
+			Comm:         &b.config.Comm,
+			DebugKeyPath: fmt.Sprintf("os_%s.pem", b.config.PackerBuildName),
+		},
+		&StepSourceImageInfo{
+			SourceImage:      b.config.RunConfig.SourceImage,
+			SourceImageName:  b.config.RunConfig.SourceImageName,
+			SourceImageOpts:  b.config.RunConfig.sourceImageOpts,
+			SourceMostRecent: b.config.SourceImageFilters.MostRecent,
+			SourceProperties: b.config.SourceImageFilters.Filters.Properties,
+		},
+		&StepCreateVolume{
+			UseBlockStorageVolume:  b.config.UseBlockStorageVolume,
+			VolumeName:             b.config.VolumeName,
+			VolumeType:             b.config.VolumeType,
+			VolumeAvailabilityZone: b.config.VolumeAvailabilityZone,
 		},
 		&StepRunSourceServer{
-			Name:             b.config.ImageName,
-			SourceImage:      b.config.SourceImage,
-			SourceImageName:  b.config.SourceImageName,
-			SecurityGroups:   b.config.SecurityGroups,
-			Networks:         b.config.Networks,
-			AvailabilityZone: b.config.AvailabilityZone,
-			UserData:         b.config.UserData,
-			UserDataFile:     b.config.UserDataFile,
-			ConfigDrive:      b.config.ConfigDrive,
+			Name:                  b.config.InstanceName,
+			SecurityGroups:        b.config.SecurityGroups,
+			Networks:              b.config.Networks,
+			Ports:                 b.config.Ports,
+			AvailabilityZone:      b.config.AvailabilityZone,
+			UserData:              b.config.UserData,
+			UserDataFile:          b.config.UserDataFile,
+			ConfigDrive:           b.config.ConfigDrive,
+			InstanceMetadata:      b.config.InstanceMetadata,
+			UseBlockStorageVolume: b.config.UseBlockStorageVolume,
+			ForceDelete:           b.config.ForceDelete,
 		},
 		&StepGetPassword{
-			Debug:            b.config.PackerDebug,
-			Comm:             &b.config.RunConfig.Comm,
+			Debug: b.config.PackerDebug,
+			Comm:  &b.config.RunConfig.Comm,
 		},
 		&StepWaitForRackConnect{
 			Wait: b.config.RackconnectWait,
 		},
 		&StepAllocateIp{
-			FloatingIpPool: b.config.FloatingIpPool,
-			FloatingIp:     b.config.FloatingIp,
+			FloatingIPNetwork: b.config.FloatingIPNetwork,
+			FloatingIP:        b.config.FloatingIP,
+			ReuseIPs:          b.config.ReuseIPs,
 		},
 		&communicator.StepConnect{
 			Config: &b.config.RunConfig.Comm,
 			Host: CommHost(
+				b.config.RunConfig.Comm.SSHHost,
 				computeClient,
 				b.config.SSHInterface,
 				b.config.SSHIPVersion),
-			SSHConfig: SSHConfig(b.config.RunConfig.Comm.SSHUsername),
+			SSHConfig: b.config.RunConfig.Comm.SSHConfigFunc(),
 		},
 		&common.StepProvision{},
+		&common.StepCleanupTempKeys{
+			Comm: &b.config.RunConfig.Comm,
+		},
 		&StepStopServer{},
-		&stepCreateImage{},
+		&StepDetachVolume{
+			UseBlockStorageVolume: b.config.UseBlockStorageVolume,
+		},
+		&stepCreateImage{
+			UseBlockStorageVolume: b.config.UseBlockStorageVolume,
+		},
+		&stepUpdateImageTags{},
+		&stepUpdateImageVisibility{},
+		&stepAddImageMembers{},
 	}
 
 	// Run!
-	if b.config.PackerDebug {
-		b.runner = &multistep.DebugRunner{
-			Steps:   steps,
-			PauseFn: common.MultistepDebugFn(ui),
-		}
-	} else {
-		b.runner = &multistep.BasicRunner{Steps: steps}
-	}
-
-	b.runner.Run(state)
+	b.runner = common.NewRunner(steps, b.config.PackerConfig, ui)
+	b.runner.Run(ctx, state)
 
 	// If there was an error, return that
 	if rawErr, ok := state.GetOk("error"); ok {
@@ -141,15 +173,8 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 	artifact := &Artifact{
 		ImageId:        state.Get("image").(string),
 		BuilderIdValue: BuilderId,
-		Client:         computeClient,
+		Client:         imageClient,
 	}
 
 	return artifact, nil
-}
-
-func (b *Builder) Cancel() {
-	if b.runner != nil {
-		log.Println("Cancelling the step runner...")
-		b.runner.Cancel()
-	}
 }

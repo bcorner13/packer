@@ -1,137 +1,250 @@
 ---
 description: |
-    
+    In order to build VMs in Azure, Packer needs various configuration options.
+    These options and how to obtain them are documented on this page.
 layout: docs
-page_title: Authorizing Packer Builds in Azure
-...
+page_title: 'Setup - Azure - Builders'
+sidebar_current: 'docs-builders-azure-setup'
+---
 
 # Authorizing Packer Builds in Azure
 
-In order to build VMs in Azure packer needs 6 configuration options to be specified:
+In order to build VMs in Azure Packer needs 6 configuration options to be
+specified:
 
-- `tenant_id` - UUID identifying your Azure account (where you login)
-- `subscription_id` - UUID identifying your Azure subscription (where billing is handled)
-- `client_id` - UUID identifying the Active Directory service principal that will run your packer builds
-- `client_secret` - service principal secret / password
-- `resource_group_name` - name of the resource group where your VHD(s) will be stored
-- `storage_account` - name of the storage account where your VHD(s) will be stored
+-   `subscription_id` - UUID identifying your Azure subscription (where billing
+    is handled)
 
--> Behind the scenes packer uses the OAuth protocol to authenticate against Azure Active Directory and authorize requests to the Azure Service Management API. These topics are unncessarily complicated so we will try to ignore them for the rest of this document.<br /><br />You do not need to understand how OAuth works in order to use Packer with Azure, though the Active Directory terms "service principal" and "role" will be useful for understanding Azure's access policies.
+-   `client_id` - UUID identifying the Active Directory service principal that
+    will run your Packer builds
 
-In order to get all of the items above, you will need a username and password for your Azure account.
+-   `client_secret` - service principal secret / password
+
+-   `resource_group_name` - name of the resource group where your VHD(s) will
+    be stored
+
+-   `storage_account` - name of the storage account where your VHD(s) will be
+    stored
+
+-&gt; Behind the scenes Packer uses the OAuth protocol to authenticate against
+Azure Active Directory and authorize requests to the Azure Service Management
+API. These topics are unnecessarily complicated so we will try to ignore them
+for the rest of this document.<br /><br />You do not need to understand how
+OAuth works in order to use Packer with Azure, though the Active Directory
+terms "service principal" and "role" will be useful for understanding Azure's
+access policies.
+
+In order to get all of the items above, you will need a username and password
+for your Azure account.
+
+## Device Login
+
+Device login is an alternative way to authorize in Azure Packer. Device login
+only requires you to know your Subscription ID. (Device login is only supported
+for Linux based VMs.) Device login is intended for those who are first time
+users, and just want to ''kick the tires.'' We recommend the SPN approach if
+you intend to automate Packer.
+
+> Device login is for **interactive** builds, and SPN is **automated** builds.
+
+There are three pieces of information you must provide to enable device login
+mode.
+
+1.  SubscriptionID
+2.  Resource Group - parent resource group that Packer uses to build an image.
+3.  Storage Account - storage account where the image will be placed.
+
+> Device login mode is enabled by not setting client\_id and client\_secret.
+
+> Device login mode is for the Public and US Gov clouds only.
+
+The device login flow asks that you open a web browser, navigate to
+<a href="http://aka.ms/devicelogin" class="uri">http://aka.ms/devicelogin</a>,
+and input the supplied code. This authorizes the Packer for Azure application
+to act on your behalf. An OAuth token will be created, and stored in the user's
+home directory (\~/.azure/packer/oauth-TenantID.json). This token is used if
+the token file exists, and it is refreshed as necessary. The token file
+prevents the need to continually execute the device login flow. Packer will ask
+for two device login auth, one for service management endpoint and another for
+accessing temp keyvault secrets that it creates.
+
+## Managed identities for Azure resources
+
+-&gt; Managed identities for Azure resources is the new name for the service
+formerly known as Managed Service Identity (MSI).
+
+Managed identities is an alternative way to authorize in Azure Packer. Managed
+identities for Azure resources are automatically managed by Azure and enable
+you to authenticate to services that support Azure AD authentication without
+needing to insert credentials into your buildfile. Navigate to
+<a href="https://docs.microsoft.com/en-gb/azure/active-directory/managed-identities-azure-resources/overview" 
+class="uri">managed identities azure resources overview</a> to learn more about
+this feature.
+
+This feature will be used when no `subscription_id`, `client_id` or
+`client_secret` is set in your buildfile.
 
 ## Install the Azure CLI
 
-To get the credentials above, we will need to install the Azure CLI. Please refer to Microsoft's official [intallation guide](https://azure.microsoft.com/en-us/documentation/articles/xplat-cli-install/).
+To get the credentials above, we will need to install the Azure CLI. Please
+refer to Microsoft's official [installation
+guide](https://azure.microsoft.com/en-us/documentation/articles/xplat-cli-install/).
 
--> The guides below also use a tool called [`jq`](https://stedolan.github.io/jq/) to simplify the output from the Azure CLI, though this is optional. If you use homebrew you can simply `brew install node jq`.
+-&gt; The guides below also use a tool called
+[`jq`](https://stedolan.github.io/jq/) to simplify the output from the Azure
+CLI, though this is optional. If you use homebrew you can simply
+`brew install node jq`.
 
-If you already have node.js installed you can use `npm` to install `azure-cli`:
+You can also use the Azure CLI in Docker. It also comes with `jq`
+pre-installed:
 
-    npm install -g azure-cli --no-progress
+``` shell
+$ docker run -it microsoft/azure-cli
+```
 
 ## Guided Setup
 
-The packer project includes a [setup script](https://github.com/mitchellh/packer/blob/master/contrib/azure-setup.sh) that can help you setup your account. It uses an interactive bash script to log you into Azure, name your resources, and export your packer configuration.
+The Packer project includes a [setup
+script](https://github.com/hashicorp/packer/blob/master/contrib/azure-setup.sh)
+that can help you setup your account. It uses an interactive bash script to log
+you into Azure, name your resources, and export your Packer configuration.
 
 ## Manual Setup
 
-If you want more control or the script does not work for you, you can also use the manual instructions below to setup your Azure account. You will need to manually keep track of the various account identifiers, resource names, and your service principal password.
+If you want more control or the script does not work for you, you can also use
+the manual instructions below to setup your Azure account. You will need to
+manually keep track of the various account identifiers, resource names, and
+your service principal password.
 
 ### Identify Your Tenant and Subscription IDs
 
 Login using the Azure CLI
 
-    azure config mode arm
-    azure login -u USERNAME
+``` shell
+$ az login
+# Note, we have launched a browser for you to login. For old experience with device code, use "az login --use-device-code"
+```
+
+Once you've completed logging in, you should get a JSON array like the one
+below:
+
+``` shell
+[
+  {
+    "cloudName": "AzureCloud",
+    "id": "$uuid",
+    "isDefault": false,
+    "name": "Pay-As-You-Go",
+    "state": "Enabled",
+    "tenantId": "$tenant_uuid",
+    "user": {
+      "name": "my_email@anywhere.com",
+      "type": "user"
+    }
+  }
+]
+```
 
 Get your account information
 
-    azure account list --json | jq .[].name
-    azure account set ACCOUNTNAME
-    azure account show --json | jq ".[] | .tenantId, .id"
+``` shell
+$ az account list --output json | jq -r '.[].name'
+$ az account set --subscription ACCOUNTNAME
+$ az account show --output json | jq -r '.id'
+```
 
--> Throughout this document when you see a command pipe to `jq` you may instead omit `--json` and everything after it, but the output will be more verbose. For example you can simply run `azure account list` instead._
+-&gt; Throughout this document when you see a command pipe to `jq` you may
+instead omit `--output json` and everything after it, but the output will be
+more verbose. For example you can simply run `az account list` instead.
 
-This will print out two lines that look like this:
+This will print out one line that look like this:
 
-    "4f562e88-8caf-421a-b4da-e3f6786c52ec"
-    "b68319b-2180-4c3e-ac1f-d44f5af2c6907"
+    4f562e88-8caf-421a-b4da-e3f6786c52ec
 
-The first one is your `tenant_id`. The second is your `subscription_id`. Note these for later.
+This is your `subscription_id`. Note it for later.
 
 ### Create a Resource Group
 
-A [resource group](https://azure.microsoft.com/en-us/documentation/articles/resource-group-overview/#resource-groups) is used to organize related resources. Resource groups and storage accounts are tied to a location. To see available locations, run:
+A [resource
+group](https://azure.microsoft.com/en-us/documentation/articles/resource-group-overview/#resource-groups)
+is used to organize related resources. Resource groups and storage accounts are
+tied to a location. To see available locations, run:
 
-    azure location list
-    ...
-    azure group create -n GROUPNAME -l LOCATION
+``` shell
+$ az account list-locations
+$ LOCATION=xxx
+$ GROUPNAME=xxx
+# ...
 
-Your storage account (below) will need to use the same `GROUPNAME` and `LOCATION`.
+$ az group create --name $GROUPNAME --location $LOCATION
+```
+
+Your storage account (below) will need to use the same `GROUPNAME` and
+`LOCATION`.
 
 ### Create a Storage Account
 
-We will need to create a storage account where your packer artifacts will be stored. We will create a `LRS` storage account which is the least expensive price/GB at the time of writing.
+We will need to create a storage account where your Packer artifacts will be
+stored. We will create a `LRS` storage account which is the least expensive
+price/GB at the time of writing.
 
-    azure storage account create -g GROUPNAME \
-        -l LOCATION --type LRS STORAGENAME
+``` shell
+$ az storage account create \
+  --name STORAGENAME
+  --resource-group $GROUPNAME \
+  --location $LOCATION \
+  --sku Standard_LRS \
+  --kind Storage
+```
 
--> `LRS` is meant as a literal "LRS" and not as a variable.
+-&gt; `LRS` and `Standard_LRS` are meant as literal "LRS" or "Standard\_LRS"
+and not as variables.
 
-Make sure that `GROUPNAME` and `LOCATION` are the same as above.
-
-### Create an Application
-
-An application represents a way to authorize access to the Azure API. Note that you will need to specify a URL for your application (this is intended to be used for OAuth callbacks) but these do not actually need to be valid URLs.
-
-    azure ad app create -n APPNAME -i APPURL --home-page APPURL -p PASSWORD
-
-Password is your `client_secret` and can be anything you like. I recommend using `openssl rand -base64 24`.
+Make sure that `GROUPNAME` and `LOCATION` are the same as above. Also, ensure
+that `GROUPNAME` is less than 24 characters long and contains only lowercase
+letters and numbers.
 
 ### Create a Service Principal
 
-You cannot directly grant permissions to an application. Instead, you create a service principal associated with the application and assign permissions to the service principal.
+A service principal acts on behalf of an application (Packer) on your Azure
+subscription. To create an application and service principal for use with
+Packer, run the below command specifying the subscription. This will grant
+Packer the contributor role to the subscription.
+The output of this command is your service principal credentials, save these in
+a safe place as you will need these to configure Packer.
 
-First, get the `APPID` for the application we just created.
+``` shell
+az ad sp create-for-rbac -n "Packer" --role contributor \
+                            --scopes /subscriptions/{SubID}
+```
 
-    azure ad app list --json | \ 
-        jq '.[] | select(.displayName | contains("APPNAME")) | .appId'
-    azure ad sp create --applicationId APPID
+The service principal credentials.
 
-### Grant Permissions to Your Application
+``` shell
+{
+  "appId": "AppId",
+  "displayName": "Packer",
+  "name": "http://Packer",
+  "password": "Password",
+  "tenant": "TenantId"
+}
+```
 
-Finally, we will associate the proper permissions with our application's service principal. We're going to assign the `Owner` role to our packer application and change the scope to manage our whole subscription. This allows Packer to create temporary resource groups for each build.
+There are a lot of pre-defined roles and you can define your own with more
+granular permissions, though this is out of scope. You can see a list of
+pre-configured roles via:
 
-    azure role assignment create --spn APPURL -o "Owner" \
-        -c /subscriptions/SUBSCRIPTIONID
+``` shell
+$ az role definition list --output json | jq ".[] | {name:.roleName, description:.description}"
+```
 
-There are a lot of pre-defined roles and you can define your own with more granular permissions, though this is out of scope. You can see a list of pre-configured roles via:
-
-    azure role list --json | \
-        jq ".[] | {name:.Name, description:.Description}"
+If you would rather use a certificate to autenticate your service principal,
+please follow the [Azure Active Directory documentation](https://docs.microsoft.com/en-us/azure/active-directory/develop/active-directory-certificate-credentials#register-your-certificate-with-azure-ad).
 
 ### Configuring Packer
 
-Now (finally) everything has been setup in Azure. Let's get our configuration keys together:
-
-Get `tenant_id` and `subscription_id`:
-
-    azure account show --json | jq ".[] | .tenantId, .id"
-
-Get `client_id`
-
-    azure ad app list --json | \
-        jq '.[] | select(.displayName | contains("APPNAME")) | .appId'
-
-Get `client_secret`
-
-This cannot be retrieved. If you forgot this, you will have to delete and re-create your service principal and the associated permissions.
-
-Get `resource_group_name`
-
-    azure group list
-
-Get `storage_account`
-
-    azure storage account list
+Now (finally) everything has been setup in Azure and our service principal has
+been created. You can use the output from creating your service principal in
+your template. Use the value from the `appId` field above as a value for
+`client_id` in your configuration and set `client_secret` to the `password`
+value from above.

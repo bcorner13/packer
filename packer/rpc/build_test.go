@@ -1,24 +1,27 @@
 package rpc
 
 import (
+	"context"
 	"errors"
-	"github.com/mitchellh/packer/packer"
 	"reflect"
 	"testing"
+
+	"github.com/hashicorp/packer/packer"
 )
 
 var testBuildArtifact = &packer.MockArtifact{}
 
 type testBuild struct {
-	nameCalled      bool
-	prepareCalled   bool
-	prepareWarnings []string
-	runCalled       bool
-	runCache        packer.Cache
-	runUi           packer.Ui
-	setDebugCalled  bool
-	setForceCalled  bool
-	cancelCalled    bool
+	nameCalled       bool
+	prepareCalled    bool
+	prepareWarnings  []string
+	runFn            func(context.Context)
+	runCalled        bool
+	runUi            packer.Ui
+	setDebugCalled   bool
+	setForceCalled   bool
+	setOnErrorCalled bool
+	cancelCalled     bool
 
 	errRunResult bool
 }
@@ -33,10 +36,13 @@ func (b *testBuild) Prepare() ([]string, error) {
 	return b.prepareWarnings, nil
 }
 
-func (b *testBuild) Run(ui packer.Ui, cache packer.Cache) ([]packer.Artifact, error) {
+func (b *testBuild) Run(ctx context.Context, ui packer.Ui) ([]packer.Artifact, error) {
 	b.runCalled = true
-	b.runCache = cache
 	b.runUi = ui
+
+	if b.runFn != nil {
+		b.runFn(ctx)
+	}
 
 	if b.errRunResult {
 		return nil, errors.New("foo")
@@ -53,8 +59,8 @@ func (b *testBuild) SetForce(bool) {
 	b.setForceCalled = true
 }
 
-func (b *testBuild) Cancel() {
-	b.cancelCalled = true
+func (b *testBuild) SetOnError(string) {
+	b.setOnErrorCalled = true
 }
 
 func TestBuild(t *testing.T) {
@@ -64,6 +70,8 @@ func TestBuild(t *testing.T) {
 	defer server.Close()
 	server.RegisterBuild(b)
 	bClient := client.Build()
+
+	ctx := context.Background()
 
 	// Test Name
 	bClient.Name()
@@ -78,9 +86,8 @@ func TestBuild(t *testing.T) {
 	}
 
 	// Test Run
-	cache := new(testCache)
 	ui := new(testUi)
-	artifacts, err := bClient.Run(ui, cache)
+	artifacts, err := bClient.Run(ctx, ui)
 	if !b.runCalled {
 		t.Fatal("run should be called")
 	}
@@ -99,7 +106,7 @@ func TestBuild(t *testing.T) {
 
 	// Test run with an error
 	b.errRunResult = true
-	_, err = bClient.Run(ui, cache)
+	_, err = bClient.Run(ctx, ui)
 	if err == nil {
 		t.Fatal("should error")
 	}
@@ -116,11 +123,38 @@ func TestBuild(t *testing.T) {
 		t.Fatal("should be called")
 	}
 
-	// Test Cancel
-	bClient.Cancel()
-	if !b.cancelCalled {
+	// Test SetOnError
+	bClient.SetOnError("ask")
+	if !b.setOnErrorCalled {
 		t.Fatal("should be called")
 	}
+}
+
+func TestBuild_cancel(t *testing.T) {
+	topCtx, cancelTopCtx := context.WithCancel(context.Background())
+
+	b := new(testBuild)
+
+	done := make(chan interface{})
+	b.runFn = func(ctx context.Context) {
+		cancelTopCtx()
+		<-ctx.Done()
+		close(done)
+	}
+
+	client, server := testClientServer(t)
+	defer client.Close()
+	defer server.Close()
+	server.RegisterBuild(b)
+	bClient := client.Build()
+
+	bClient.Prepare()
+
+	ui := new(testUi)
+	bClient.Run(topCtx, ui)
+
+	// if context cancellation is not propagated, this will timeout
+	<-done
 }
 
 func TestBuildPrepare_Warnings(t *testing.T) {

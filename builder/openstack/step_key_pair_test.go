@@ -2,10 +2,11 @@ package openstack
 
 import (
 	"bytes"
-	"github.com/mitchellh/packer/packer"
-	"golang.org/x/crypto/ssh"
 	"os/exec"
 	"testing"
+
+	"github.com/hashicorp/packer/packer"
+	"golang.org/x/crypto/ssh"
 )
 
 var ber_encoded_key = `
@@ -71,7 +72,7 @@ mKMH6Gf6COfSIbLuejdzSOUAmjkFpm+nwBkka1eHdAy4ALn9wNQz3w==
 func TestBerToDer(t *testing.T) {
 	_, err := exec.LookPath("openssl")
 	if err != nil {
-		t.Skipf("OpenSSL not availible skippint test.")
+		t.Skipf("OpenSSL not available skipping test.")
 	}
 
 	msg := new(bytes.Buffer)
@@ -80,8 +81,8 @@ func TestBerToDer(t *testing.T) {
 		Writer: msg,
 	}
 
-	// Test - a DER encoded key commes back unchanged.
-	newKey := berToDer(der_encoded_key, ui)
+	// Test - a DER encoded key comes back unchanged.
+	newKey := string(berToDer([]byte(der_encoded_key), ui))
 	if newKey != der_encoded_key {
 		t.Errorf("Trying to convert a DER encoded key should return the same key.")
 	}
@@ -90,7 +91,7 @@ func TestBerToDer(t *testing.T) {
 	}
 
 	// Test - a BER encoded key should be converted to DER.
-	newKey = berToDer(ber_encoded_key, ui)
+	newKey = string(berToDer([]byte(ber_encoded_key), ui))
 	_, err = ssh.ParsePrivateKey([]byte(newKey))
 	if err != nil {
 		t.Errorf("Trying to convert a BER encoded key should return a DER encoded key parsable by Go.")

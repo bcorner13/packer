@@ -1,28 +1,40 @@
 package common
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 // BlockDevice
 type BlockDevice struct {
 	DeleteOnTermination bool   `mapstructure:"delete_on_termination"`
 	DeviceName          string `mapstructure:"device_name"`
-	Encrypted           bool   `mapstructure:"encrypted"`
+	Encrypted           *bool  `mapstructure:"encrypted"`
 	IOPS                int64  `mapstructure:"iops"`
 	NoDevice            bool   `mapstructure:"no_device"`
 	SnapshotId          string `mapstructure:"snapshot_id"`
 	VirtualName         string `mapstructure:"virtual_name"`
 	VolumeType          string `mapstructure:"volume_type"`
 	VolumeSize          int64  `mapstructure:"volume_size"`
+	KmsKeyId            string `mapstructure:"kms_key_id"`
+	// ebssurrogate only
+	OmitFromArtifact bool `mapstructure:"omit_from_artifact"`
 }
 
 type BlockDevices struct {
-	AMIMappings    []BlockDevice `mapstructure:"ami_block_device_mappings"`
+	AMIBlockDevices    `mapstructure:",squash"`
+	LaunchBlockDevices `mapstructure:",squash"`
+}
+
+type AMIBlockDevices struct {
+	AMIMappings []BlockDevice `mapstructure:"ami_block_device_mappings"`
+}
+
+type LaunchBlockDevices struct {
 	LaunchMappings []BlockDevice `mapstructure:"launch_block_device_mappings"`
 }
 
@@ -61,8 +73,11 @@ func buildBlockDevices(b []BlockDevice) []*ec2.BlockDeviceMapping {
 			// You cannot specify Encrypted if you specify a Snapshot ID
 			if blockDevice.SnapshotId != "" {
 				ebsBlockDevice.SnapshotId = aws.String(blockDevice.SnapshotId)
-			} else if blockDevice.Encrypted {
-				ebsBlockDevice.Encrypted = aws.Bool(blockDevice.Encrypted)
+			}
+			ebsBlockDevice.Encrypted = blockDevice.Encrypted
+
+			if blockDevice.KmsKeyId != "" {
+				ebsBlockDevice.KmsKeyId = aws.String(blockDevice.KmsKeyId)
 			}
 
 			mapping.Ebs = ebsBlockDevice
@@ -73,14 +88,48 @@ func buildBlockDevices(b []BlockDevice) []*ec2.BlockDeviceMapping {
 	return blockDevices
 }
 
-func (b *BlockDevices) Prepare(ctx *interpolate.Context) []error {
+func (b *BlockDevice) Prepare(ctx *interpolate.Context) error {
+	if b.DeviceName == "" {
+		return fmt.Errorf("The `device_name` must be specified " +
+			"for every device in the block device mapping.")
+	}
+	// Warn that encrypted must be true when setting kms_key_id
+	if b.KmsKeyId != "" && b.Encrypted != nil && *b.Encrypted == false {
+		return fmt.Errorf("The device %v, must also have `encrypted: "+
+			"true` when setting a kms_key_id.", b.DeviceName)
+	}
+
 	return nil
 }
 
-func (b *BlockDevices) BuildAMIDevices() []*ec2.BlockDeviceMapping {
+func (b *BlockDevices) Prepare(ctx *interpolate.Context) (errs []error) {
+	for _, d := range b.AMIMappings {
+		if err := d.Prepare(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("AMIMapping: %s", err.Error()))
+		}
+	}
+	for _, d := range b.LaunchMappings {
+		if err := d.Prepare(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("LaunchMapping: %s", err.Error()))
+		}
+	}
+	return errs
+}
+
+func (b *AMIBlockDevices) BuildAMIDevices() []*ec2.BlockDeviceMapping {
 	return buildBlockDevices(b.AMIMappings)
 }
 
-func (b *BlockDevices) BuildLaunchDevices() []*ec2.BlockDeviceMapping {
+func (b *LaunchBlockDevices) BuildLaunchDevices() []*ec2.BlockDeviceMapping {
 	return buildBlockDevices(b.LaunchMappings)
+}
+
+func (b *LaunchBlockDevices) GetOmissions() map[string]bool {
+	omitMap := make(map[string]bool)
+
+	for _, blockDevice := range b.LaunchMappings {
+		omitMap[blockDevice.DeviceName] = blockDevice.OmitFromArtifact
+	}
+
+	return omitMap
 }

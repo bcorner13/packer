@@ -3,6 +3,7 @@ package ansible
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -15,18 +16,23 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/helper/config"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/common/adapter"
+	commonhelper "github.com/hashicorp/packer/helper/common"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/packer/tmp"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 type Config struct {
@@ -47,23 +53,36 @@ type Config struct {
 	EmptyGroups          []string `mapstructure:"empty_groups"`
 	HostAlias            string   `mapstructure:"host_alias"`
 	User                 string   `mapstructure:"user"`
-	LocalPort            string   `mapstructure:"local_port"`
+	LocalPort            int      `mapstructure:"local_port"`
 	SSHHostKeyFile       string   `mapstructure:"ssh_host_key_file"`
 	SSHAuthorizedKeyFile string   `mapstructure:"ssh_authorized_key_file"`
 	SFTPCmd              string   `mapstructure:"sftp_command"`
-	inventoryFile        string
+	SkipVersionCheck     bool     `mapstructure:"skip_version_check"`
+	UseSFTP              bool     `mapstructure:"use_sftp"`
+	InventoryDirectory   string   `mapstructure:"inventory_directory"`
+	InventoryFile        string   `mapstructure:"inventory_file"`
 }
 
 type Provisioner struct {
 	config            Config
-	adapter           *adapter
+	adapter           *adapter.Adapter
 	done              chan struct{}
 	ansibleVersion    string
 	ansibleMajVersion uint
 }
 
+type PassthroughTemplate struct {
+	WinRMPassword string
+}
+
 func (p *Provisioner) Prepare(raws ...interface{}) error {
 	p.done = make(chan struct{})
+
+	// Create passthrough for winrm password so we can fill it in once we know
+	// it
+	p.config.ctx.Data = &PassthroughTemplate{
+		WinRMPassword: `{{.WinRMPassword}}`,
+	}
 
 	err := config.Decode(&p.config, &config.DecodeOpts{
 		Interpolate:        true,
@@ -105,23 +124,40 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 			log.Println(p.config.SSHHostKeyFile, "does not exist")
 			errs = packer.MultiErrorAppend(errs, err)
 		}
-	}
-
-	if len(p.config.LocalPort) > 0 {
-		if _, err := strconv.ParseUint(p.config.LocalPort, 10, 16); err != nil {
-			errs = packer.MultiErrorAppend(errs, fmt.Errorf("local_port: %s must be a valid port", p.config.LocalPort))
-		}
 	} else {
-		p.config.LocalPort = "0"
+		p.config.AnsibleEnvVars = append(p.config.AnsibleEnvVars, "ANSIBLE_HOST_KEY_CHECKING=False")
 	}
 
-	err = p.getVersion()
-	if err != nil {
-		errs = packer.MultiErrorAppend(errs, err)
+	if !p.config.UseSFTP {
+		p.config.AnsibleEnvVars = append(p.config.AnsibleEnvVars, "ANSIBLE_SCP_IF_SSH=True")
+	}
+
+	if p.config.LocalPort > 65535 {
+		errs = packer.MultiErrorAppend(errs, fmt.Errorf("local_port: %d must be a valid port", p.config.LocalPort))
+	}
+
+	if len(p.config.InventoryDirectory) > 0 {
+		err = validateInventoryDirectoryConfig(p.config.InventoryDirectory)
+		if err != nil {
+			log.Println(p.config.InventoryDirectory, "does not exist")
+			errs = packer.MultiErrorAppend(errs, err)
+		}
+	}
+
+	if !p.config.SkipVersionCheck {
+		err = p.getVersion()
+		if err != nil {
+			errs = packer.MultiErrorAppend(errs, err)
+		}
 	}
 
 	if p.config.User == "" {
-		p.config.User = os.Getenv("USER")
+		usr, err := user.Current()
+		if err != nil {
+			errs = packer.MultiErrorAppend(errs, err)
+		} else {
+			p.config.User = usr.Username
+		}
 	}
 	if p.config.User == "" {
 		errs = packer.MultiErrorAppend(errs, fmt.Errorf("user: could not determine current user from environment."))
@@ -136,7 +172,8 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 func (p *Provisioner) getVersion() error {
 	out, err := exec.Command(p.config.Command, "--version").Output()
 	if err != nil {
-		return err
+		return fmt.Errorf(
+			"Error running \"%s --version\": %s", p.config.Command, err.Error())
 	}
 
 	versionRe := regexp.MustCompile(`\w (\d+\.\d+[.\d+]*)`)
@@ -159,8 +196,27 @@ func (p *Provisioner) getVersion() error {
 	return nil
 }
 
-func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
+func (p *Provisioner) Provision(ctx context.Context, ui packer.Ui, comm packer.Communicator) error {
 	ui.Say("Provisioning with Ansible...")
+	// Interpolate env vars to check for .WinRMPassword
+	p.config.ctx.Data = &PassthroughTemplate{
+		WinRMPassword: getWinRMPassword(p.config.PackerBuildName),
+	}
+	for i, envVar := range p.config.AnsibleEnvVars {
+		envVar, err := interpolate.Render(envVar, &p.config.ctx)
+		if err != nil {
+			return fmt.Errorf("Could not interpolate ansible env vars: %s", err)
+		}
+		p.config.AnsibleEnvVars[i] = envVar
+	}
+	// Interpolate extra vars to check for .WinRMPassword
+	for i, arg := range p.config.ExtraArguments {
+		arg, err := interpolate.Render(arg, &p.config.ctx)
+		if err != nil {
+			return fmt.Errorf("Could not interpolate ansible env vars: %s", err)
+		}
+		p.config.ExtraArguments[i] = arg
+	}
 
 	k, err := newUserKey(p.config.SSHAuthorizedKeyFile)
 	if err != nil {
@@ -176,22 +232,21 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 	keyChecker := ssh.CertChecker{
 		UserKeyFallback: func(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 			if user := conn.User(); user != p.config.User {
-				ui.Say(fmt.Sprintf("%s is not a valid user", user))
-				return nil, errors.New("authentication failed")
+				return nil, errors.New(fmt.Sprintf("authentication failed: %s is not a valid user", user))
 			}
 
 			if !bytes.Equal(k.Marshal(), pubKey.Marshal()) {
-				ui.Say("unauthorized key")
-				return nil, errors.New("authentication failed")
+				return nil, errors.New("authentication failed: unauthorized key")
 			}
 
 			return nil, nil
 		},
+		IsUserAuthority: func(k ssh.PublicKey) bool { return true },
 	}
 
 	config := &ssh.ServerConfig{
 		AuthLogCallback: func(conn ssh.ConnMetadata, method string, err error) {
-			ui.Say(fmt.Sprintf("authentication attempt from %s to %s as %s using %s", conn.RemoteAddr(), conn.LocalAddr(), conn.User(), method))
+			log.Printf("authentication attempt from %s to %s as %s using %s", conn.RemoteAddr(), conn.LocalAddr(), conn.User(), method)
 		},
 		PublicKeyCallback: keyChecker.Authenticate,
 		//NoClientAuth:      true,
@@ -200,11 +255,8 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 	config.AddHostKey(hostSigner)
 
 	localListener, err := func() (net.Listener, error) {
-		port, err := strconv.ParseUint(p.config.LocalPort, 10, 16)
-		if err != nil {
-			return nil, err
-		}
 
+		port := p.config.LocalPort
 		tries := 1
 		if port != 0 {
 			tries = 10
@@ -216,7 +268,12 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 				ui.Say(err.Error())
 				continue
 			}
-			_, p.config.LocalPort, err = net.SplitHostPort(l.Addr().String())
+			_, portStr, err := net.SplitHostPort(l.Addr().String())
+			if err != nil {
+				ui.Say(err.Error())
+				continue
+			}
+			p.config.LocalPort, err = strconv.Atoi(portStr)
 			if err != nil {
 				ui.Say(err.Error())
 				continue
@@ -230,28 +287,31 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 		return err
 	}
 
-	ui = newUi(ui)
-	p.adapter = newAdapter(p.done, localListener, config, p.config.SFTPCmd, ui, comm)
+	ui = &packer.SafeUi{
+		Sem: make(chan int, 1),
+		Ui:  ui,
+	}
+	p.adapter = adapter.NewAdapter(p.done, localListener, config, p.config.SFTPCmd, ui, comm)
 
 	defer func() {
-		ui.Say("shutting down the SSH proxy")
+		log.Print("shutting down the SSH proxy")
 		close(p.done)
 		p.adapter.Shutdown()
 	}()
 
 	go p.adapter.Serve()
 
-	if len(p.config.inventoryFile) == 0 {
-		tf, err := ioutil.TempFile("", "packer-provisioner-ansible")
+	if len(p.config.InventoryFile) == 0 {
+		tf, err := ioutil.TempFile(p.config.InventoryDirectory, "packer-provisioner-ansible")
 		if err != nil {
 			return fmt.Errorf("Error preparing inventory file: %s", err)
 		}
 		defer os.Remove(tf.Name())
 
-		host := fmt.Sprintf("%s ansible_host=127.0.0.1 ansible_user=%s ansible_port=%s\n",
+		host := fmt.Sprintf("%s ansible_host=127.0.0.1 ansible_user=%s ansible_port=%d\n",
 			p.config.HostAlias, p.config.User, p.config.LocalPort)
 		if p.ansibleMajVersion < 2 {
-			host = fmt.Sprintf("%s ansible_ssh_host=127.0.0.1 ansible_ssh_user=%s ansible_ssh_port=%s\n",
+			host = fmt.Sprintf("%s ansible_ssh_host=127.0.0.1 ansible_ssh_user=%s ansible_ssh_port=%d\n",
 				p.config.HostAlias, p.config.User, p.config.LocalPort)
 		}
 
@@ -270,13 +330,13 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 			return fmt.Errorf("Error preparing inventory file: %s", err)
 		}
 		tf.Close()
-		p.config.inventoryFile = tf.Name()
+		p.config.InventoryFile = tf.Name()
 		defer func() {
-			p.config.inventoryFile = ""
+			p.config.InventoryFile = ""
 		}()
 	}
 
-	if err := p.executeAnsible(ui, comm, k.privKeyFile, !hostSigner.generated); err != nil {
+	if err := p.executeAnsible(ui, comm, k.privKeyFile); err != nil {
 		return fmt.Errorf("Error executing Ansible: %s", err)
 	}
 
@@ -293,15 +353,29 @@ func (p *Provisioner) Cancel() {
 	os.Exit(0)
 }
 
-func (p *Provisioner) executeAnsible(ui packer.Ui, comm packer.Communicator, privKeyFile string, checkHostKey bool) error {
+func (p *Provisioner) executeAnsible(ui packer.Ui, comm packer.Communicator, privKeyFile string) error {
 	playbook, _ := filepath.Abs(p.config.PlaybookFile)
-	inventory := p.config.inventoryFile
+	inventory := p.config.InventoryFile
+
 	var envvars []string
 
-	args := []string{playbook, "-i", inventory}
+	args := []string{"--extra-vars", fmt.Sprintf("packer_build_name=%s packer_builder_type=%s -o IdentitiesOnly=yes",
+		p.config.PackerBuildName, p.config.PackerBuilderType),
+		"-i", inventory, playbook}
 	if len(privKeyFile) > 0 {
-		args = append(args, "--private-key", privKeyFile)
+		// Changed this from using --private-key to supplying -e ansible_ssh_private_key_file as the latter
+		// is treated as a highest priority variable, and thus prevents overriding by dynamic variables
+		// as seen in #5852
+		// args = append(args, "--private-key", privKeyFile)
+		args = append(args, "-e", fmt.Sprintf("ansible_ssh_private_key_file=%s", privKeyFile))
 	}
+
+	// expose packer_http_addr extra variable
+	httpAddr := common.GetHTTPAddr()
+	if httpAddr != "" {
+		args = append(args, "--extra-vars", fmt.Sprintf("packer_http_addr=%s", httpAddr))
+	}
+
 	args = append(args, p.config.ExtraArguments...)
 	if len(p.config.AnsibleEnvVars) > 0 {
 		envvars = append(envvars, p.config.AnsibleEnvVars...)
@@ -312,8 +386,6 @@ func (p *Provisioner) executeAnsible(ui packer.Ui, comm packer.Communicator, pri
 	cmd.Env = os.Environ()
 	if len(envvars) > 0 {
 		cmd.Env = append(cmd.Env, envvars...)
-	} else if !checkHostKey {
-		cmd.Env = append(cmd.Env, "ANSIBLE_HOST_KEY_CHECKING=False")
 	}
 
 	stdout, err := cmd.StdoutPipe()
@@ -327,12 +399,21 @@ func (p *Provisioner) executeAnsible(ui packer.Ui, comm packer.Communicator, pri
 
 	wg := sync.WaitGroup{}
 	repeat := func(r io.ReadCloser) {
-		scanner := bufio.NewScanner(r)
-		for scanner.Scan() {
-			ui.Message(scanner.Text())
-		}
-		if err := scanner.Err(); err != nil {
-			ui.Error(err.Error())
+		reader := bufio.NewReader(r)
+		for {
+			line, err := reader.ReadString('\n')
+			if line != "" {
+				line = strings.TrimRightFunc(line, unicode.IsSpace)
+				ui.Message(line)
+			}
+			if err != nil {
+				if err == io.EOF {
+					break
+				} else {
+					ui.Error(err.Error())
+					break
+				}
+			}
 		}
 		wg.Done()
 	}
@@ -340,8 +421,18 @@ func (p *Provisioner) executeAnsible(ui packer.Ui, comm packer.Communicator, pri
 	go repeat(stdout)
 	go repeat(stderr)
 
-	ui.Say(fmt.Sprintf("Executing Ansible: %s", strings.Join(cmd.Args, " ")))
-	cmd.Start()
+	// remove winrm password from command, if it's been added
+	flattenedCmd := strings.Join(cmd.Args, " ")
+	sanitized := flattenedCmd
+	if len(getWinRMPassword(p.config.PackerBuildName)) > 0 {
+		sanitized = strings.Replace(sanitized,
+			getWinRMPassword(p.config.PackerBuildName), "*****", -1)
+	}
+	ui.Say(fmt.Sprintf("Executing Ansible: %s", sanitized))
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
 	wg.Wait()
 	err = cmd.Wait()
 	if err != nil {
@@ -362,6 +453,16 @@ func validateFileConfig(name string, config string, req bool) error {
 		return fmt.Errorf("%s: %s is invalid: %s", config, name, err)
 	} else if info.IsDir() {
 		return fmt.Errorf("%s: %s must point to a file", config, name)
+	}
+	return nil
+}
+
+func validateInventoryDirectoryConfig(name string) error {
+	info, err := os.Stat(name)
+	if err != nil {
+		return fmt.Errorf("inventory_directory: %s is invalid: %s", name, err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("inventory_directory: %s must point to a directory", name)
 	}
 	return nil
 }
@@ -403,7 +504,7 @@ func newUserKey(pubKeyFile string) (*userKey, error) {
 		Headers: nil,
 		Bytes:   privateKeyDer,
 	}
-	tf, err := ioutil.TempFile("", "ansible-key")
+	tf, err := tmp.File("ansible-key")
 	if err != nil {
 		return nil, errors.New("failed to create temp file for generated key")
 	}
@@ -423,7 +524,6 @@ func newUserKey(pubKeyFile string) (*userKey, error) {
 
 type signer struct {
 	ssh.Signer
-	generated bool
 }
 
 func newSigner(privKeyFile string) (*signer, error) {
@@ -452,49 +552,12 @@ func newSigner(privKeyFile string) (*signer, error) {
 	if err != nil {
 		return nil, errors.New("Failed to extract private key from generated key pair")
 	}
-	signer.generated = true
 
 	return signer, nil
 }
 
-// Ui provides concurrency-safe access to packer.Ui.
-type Ui struct {
-	sem chan int
-	ui  packer.Ui
-}
-
-func newUi(ui packer.Ui) packer.Ui {
-	return &Ui{sem: make(chan int, 1), ui: ui}
-}
-
-func (ui *Ui) Ask(s string) (string, error) {
-	ui.sem <- 1
-	ret, err := ui.ui.Ask(s)
-	<-ui.sem
-
-	return ret, err
-}
-
-func (ui *Ui) Say(s string) {
-	ui.sem <- 1
-	ui.ui.Say(s)
-	<-ui.sem
-}
-
-func (ui *Ui) Message(s string) {
-	ui.sem <- 1
-	ui.ui.Message(s)
-	<-ui.sem
-}
-
-func (ui *Ui) Error(s string) {
-	ui.sem <- 1
-	ui.ui.Error(s)
-	<-ui.sem
-}
-
-func (ui *Ui) Machine(t string, args ...string) {
-	ui.sem <- 1
-	ui.ui.Machine(t, args...)
-	<-ui.sem
+func getWinRMPassword(buildName string) string {
+	winRMPass, _ := commonhelper.RetrieveSharedState("winrm_password", buildName)
+	packer.LogSecretFilter.Set(winRMPass)
+	return winRMPass
 }

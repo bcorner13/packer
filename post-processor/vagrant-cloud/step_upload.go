@@ -1,17 +1,20 @@
 package vagrantcloud
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"time"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/common/retry"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 )
 
 type stepUpload struct {
 }
 
-func (s *stepUpload) Run(state multistep.StateBag) multistep.StepAction {
+func (s *stepUpload) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
 	client := state.Get("client").(*VagrantCloudClient)
 	ui := state.Get("ui").(packer.Ui)
 	upload := state.Get("upload").(*Upload)
@@ -23,38 +26,35 @@ func (s *stepUpload) Run(state multistep.StateBag) multistep.StepAction {
 		"Depending on your internet connection and the size of the box,\n" +
 			"this may take some time")
 
-	var finalErr error
-	for i := 0; i < 3; i++ {
-		if i > 0 {
-			ui.Message(fmt.Sprintf("Uploading box, attempt %d", i+1))
-		}
+	err := retry.Config{
+		Tries:      3,
+		RetryDelay: (&retry.Backoff{InitialBackoff: 10 * time.Second, MaxBackoff: 10 * time.Second, Multiplier: 2}).Linear,
+	}.Run(ctx, func(ctx context.Context) error {
+		ui.Message(fmt.Sprintf("Uploading box"))
 
 		resp, err := client.Upload(artifactFilePath, url)
 		if err != nil {
-			finalErr = err
 			ui.Message(fmt.Sprintf(
 				"Error uploading box! Will retry in 10 seconds. Error: %s", err))
-			time.Sleep(10 * time.Second)
-			continue
+			return err
 		}
 		if resp.StatusCode != 200 {
-			finalErr = fmt.Errorf("bad HTTP status: %d", resp.StatusCode)
+			err := fmt.Errorf("bad HTTP status: %d", resp.StatusCode)
+			log.Print(err)
 			ui.Message(fmt.Sprintf(
 				"Error uploading box! Will retry in 10 seconds. Status: %d",
 				resp.StatusCode))
-			time.Sleep(10 * time.Second)
-			continue
+			return err
 		}
+		return err
+	})
 
-		finalErr = nil
-	}
-
-	if finalErr != nil {
-		state.Put("error", finalErr)
+	if err != nil {
+		state.Put("error", err)
 		return multistep.ActionHalt
 	}
 
-	ui.Message("Box succesfully uploaded")
+	ui.Message("Box successfully uploaded")
 
 	return multistep.ActionContinue
 }

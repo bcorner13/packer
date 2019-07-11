@@ -1,11 +1,13 @@
 package qemu
 
 import (
-	"github.com/mitchellh/packer/packer"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
+
+	"github.com/hashicorp/packer/packer"
 )
 
 var testPem = `
@@ -92,12 +94,12 @@ func TestBuilderPrepare_Defaults(t *testing.T) {
 	}
 }
 
-func TestBuilderPrepare_BootWait(t *testing.T) {
+func TestBuilderPrepare_VNCBindAddress(t *testing.T) {
 	var b Builder
 	config := testConfig()
 
 	// Test a default boot_wait
-	delete(config, "boot_wait")
+	delete(config, "vnc_bind_address")
 	warns, err := b.Prepare(config)
 	if len(warns) > 0 {
 		t.Fatalf("bad: %#v", warns)
@@ -106,29 +108,8 @@ func TestBuilderPrepare_BootWait(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
-	if b.config.RawBootWait != "10s" {
-		t.Fatalf("bad value: %s", b.config.RawBootWait)
-	}
-
-	// Test with a bad boot_wait
-	config["boot_wait"] = "this is not good"
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err == nil {
-		t.Fatal("should have error")
-	}
-
-	// Test with a good one
-	config["boot_wait"] = "5s"
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err != nil {
-		t.Fatalf("should not have error: %s", err)
+	if b.config.VNCBindAddress != "127.0.0.1" {
+		t.Fatalf("bad value: %s", b.config.VNCBindAddress)
 	}
 }
 
@@ -187,7 +168,7 @@ func TestBuilderPrepare_DiskSize(t *testing.T) {
 		t.Fatalf("bad err: %s", err)
 	}
 
-	if b.config.DiskSize != 40000 {
+	if b.config.DiskSize != 40960 {
 		t.Fatalf("bad size: %d", b.config.DiskSize)
 	}
 
@@ -203,6 +184,36 @@ func TestBuilderPrepare_DiskSize(t *testing.T) {
 
 	if b.config.DiskSize != 60000 {
 		t.Fatalf("bad size: %d", b.config.DiskSize)
+	}
+}
+
+func TestBuilderPrepare_AdditionalDiskSize(t *testing.T) {
+	var b Builder
+	config := testConfig()
+
+	config["disk_additional_size"] = []string{"1M"}
+	config["disk_image"] = true
+	warns, err := b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err == nil {
+		t.Fatalf("should have error")
+	}
+
+	delete(config, "disk_image")
+	config["disk_additional_size"] = []string{"1M"}
+	b = Builder{}
+	warns, err = b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
+	}
+
+	if b.config.AdditionalDiskSize[0] != "1M" {
+		t.Fatalf("bad size: %s", b.config.AdditionalDiskSize)
 	}
 }
 
@@ -240,6 +251,98 @@ func TestBuilderPrepare_Format(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("should not have error: %s", err)
+	}
+}
+
+func TestBuilderPrepare_UseBackingFile(t *testing.T) {
+	var b Builder
+	config := testConfig()
+
+	config["use_backing_file"] = true
+
+	// Bad: iso_url is not a disk_image
+	config["disk_image"] = false
+	config["format"] = "qcow2"
+	b = Builder{}
+	warns, err := b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err == nil {
+		t.Fatal("should have error")
+	}
+
+	// Bad: format is not 'qcow2'
+	config["disk_image"] = true
+	config["format"] = "raw"
+	b = Builder{}
+	warns, err = b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err == nil {
+		t.Fatal("should have error")
+	}
+
+	// Good: iso_url is a disk image and format is 'qcow2'
+	config["disk_image"] = true
+	config["format"] = "qcow2"
+	b = Builder{}
+	warns, err = b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
+	}
+}
+
+func TestBuilderPrepare_FloppyFiles(t *testing.T) {
+	var b Builder
+	config := testConfig()
+
+	delete(config, "floppy_files")
+	warns, err := b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err != nil {
+		t.Fatalf("bad err: %s", err)
+	}
+
+	if len(b.config.FloppyFiles) != 0 {
+		t.Fatalf("bad: %#v", b.config.FloppyFiles)
+	}
+
+	floppies_path := "../../common/test-fixtures/floppies"
+	config["floppy_files"] = []string{fmt.Sprintf("%s/bar.bat", floppies_path), fmt.Sprintf("%s/foo.ps1", floppies_path)}
+	b = Builder{}
+	warns, err = b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
+	}
+
+	expected := []string{fmt.Sprintf("%s/bar.bat", floppies_path), fmt.Sprintf("%s/foo.ps1", floppies_path)}
+	if !reflect.DeepEqual(b.config.FloppyFiles, expected) {
+		t.Fatalf("bad: %#v", b.config.FloppyFiles)
+	}
+}
+
+func TestBuilderPrepare_InvalidFloppies(t *testing.T) {
+	var b Builder
+	config := testConfig()
+	config["floppy_files"] = []string{"nonexistent.bat", "nonexistent.ps1"}
+	b = Builder{}
+	_, errs := b.Prepare(config)
+	if errs == nil {
+		t.Fatalf("Nonexistent floppies should trigger multierror")
+	}
+
+	if len(errs.(*packer.MultiError).Errors) != 2 {
+		t.Fatalf("Multierror should work and report 2 errors")
 	}
 }
 
@@ -418,31 +521,6 @@ func TestBuilderPrepare_SSHPrivateKey(t *testing.T) {
 	}
 }
 
-func TestBuilderPrepare_SSHUser(t *testing.T) {
-	var b Builder
-	config := testConfig()
-
-	config["ssh_username"] = ""
-	b = Builder{}
-	warns, err := b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err == nil {
-		t.Fatal("should have error")
-	}
-
-	config["ssh_username"] = "exists"
-	b = Builder{}
-	warns, err = b.Prepare(config)
-	if len(warns) > 0 {
-		t.Fatalf("bad: %#v", warns)
-	}
-	if err != nil {
-		t.Fatalf("should not have error: %s", err)
-	}
-}
-
 func TestBuilderPrepare_SSHWaitTimeout(t *testing.T) {
 	var b Builder
 	config := testConfig()
@@ -500,7 +578,7 @@ func TestBuilderPrepare_QemuArgs(t *testing.T) {
 
 	// Test with a good one
 	config["qemuargs"] = [][]interface{}{
-		[]interface{}{"foo", "bar", "baz"},
+		{"foo", "bar", "baz"},
 	}
 
 	b = Builder{}
@@ -513,7 +591,7 @@ func TestBuilderPrepare_QemuArgs(t *testing.T) {
 	}
 
 	expected := [][]string{
-		[]string{"foo", "bar", "baz"},
+		{"foo", "bar", "baz"},
 	}
 
 	if !reflect.DeepEqual(b.config.QemuArgs, expected) {

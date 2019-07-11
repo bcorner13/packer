@@ -4,13 +4,10 @@ import (
 	"io"
 	"log"
 	"net/rpc"
-	"sync/atomic"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 	"github.com/ugorji/go/codec"
 )
-
-var endpointId uint64
 
 const (
 	DefaultArtifactEndpoint      string = "Artifact"
@@ -35,12 +32,15 @@ type Server struct {
 }
 
 // NewServer returns a new Packer RPC server.
-func NewServer(conn io.ReadWriteCloser) *Server {
-	mux, _ := newMuxBrokerServer(conn)
+func NewServer(conn io.ReadWriteCloser) (*Server, error) {
+	mux, err := newMuxBrokerServer(conn)
+	if err != nil {
+		return nil, err
+	}
 	result := newServerWithMux(mux, 0)
 	result.closeMux = true
 	go mux.Run()
-	return result
+	return result, nil
 }
 
 func newServerWithMux(mux *muxBroker, streamId uint32) *Server {
@@ -61,63 +61,58 @@ func (s *Server) Close() error {
 	return nil
 }
 
-func (s *Server) RegisterArtifact(a packer.Artifact) {
-	s.server.RegisterName(DefaultArtifactEndpoint, &ArtifactServer{
+func (s *Server) RegisterArtifact(a packer.Artifact) error {
+	return s.server.RegisterName(DefaultArtifactEndpoint, &ArtifactServer{
 		artifact: a,
 	})
 }
 
-func (s *Server) RegisterBuild(b packer.Build) {
-	s.server.RegisterName(DefaultBuildEndpoint, &BuildServer{
+func (s *Server) RegisterBuild(b packer.Build) error {
+	return s.server.RegisterName(DefaultBuildEndpoint, &BuildServer{
 		build: b,
 		mux:   s.mux,
 	})
 }
 
-func (s *Server) RegisterBuilder(b packer.Builder) {
-	s.server.RegisterName(DefaultBuilderEndpoint, &BuilderServer{
+func (s *Server) RegisterBuilder(b packer.Builder) error {
+	return s.server.RegisterName(DefaultBuilderEndpoint, &BuilderServer{
 		builder: b,
 		mux:     s.mux,
 	})
 }
 
-func (s *Server) RegisterCache(c packer.Cache) {
-	s.server.RegisterName(DefaultCacheEndpoint, &CacheServer{
-		cache: c,
-	})
-}
-
-func (s *Server) RegisterCommunicator(c packer.Communicator) {
-	s.server.RegisterName(DefaultCommunicatorEndpoint, &CommunicatorServer{
+func (s *Server) RegisterCommunicator(c packer.Communicator) error {
+	return s.server.RegisterName(DefaultCommunicatorEndpoint, &CommunicatorServer{
 		c:   c,
 		mux: s.mux,
 	})
 }
 
-func (s *Server) RegisterHook(h packer.Hook) {
-	s.server.RegisterName(DefaultHookEndpoint, &HookServer{
+func (s *Server) RegisterHook(h packer.Hook) error {
+	return s.server.RegisterName(DefaultHookEndpoint, &HookServer{
 		hook: h,
 		mux:  s.mux,
 	})
 }
 
-func (s *Server) RegisterPostProcessor(p packer.PostProcessor) {
-	s.server.RegisterName(DefaultPostProcessorEndpoint, &PostProcessorServer{
+func (s *Server) RegisterPostProcessor(p packer.PostProcessor) error {
+	return s.server.RegisterName(DefaultPostProcessorEndpoint, &PostProcessorServer{
 		mux: s.mux,
 		p:   p,
 	})
 }
 
-func (s *Server) RegisterProvisioner(p packer.Provisioner) {
-	s.server.RegisterName(DefaultProvisionerEndpoint, &ProvisionerServer{
+func (s *Server) RegisterProvisioner(p packer.Provisioner) error {
+	return s.server.RegisterName(DefaultProvisionerEndpoint, &ProvisionerServer{
 		mux: s.mux,
 		p:   p,
 	})
 }
 
-func (s *Server) RegisterUi(ui packer.Ui) {
-	s.server.RegisterName(DefaultUiEndpoint, &UiServer{
-		ui: ui,
+func (s *Server) RegisterUi(ui packer.Ui) error {
+	return s.server.RegisterName(DefaultUiEndpoint, &UiServer{
+		ui:       ui,
+		register: s.server.RegisterName,
 	})
 }
 
@@ -139,19 +134,4 @@ func (s *Server) Serve() {
 	}
 	rpcCodec := codec.GoRpc.ServerCodec(stream, h)
 	s.server.ServeCodec(rpcCodec)
-}
-
-// registerComponent registers a single Packer RPC component onto
-// the RPC server. If id is true, then a unique ID number will be appended
-// onto the end of the endpoint.
-//
-// The endpoint name is returned.
-func registerComponent(server *rpc.Server, name string, rcvr interface{}, id bool) string {
-	endpoint := name
-	if id {
-		log.Printf("%s.%d", endpoint, atomic.AddUint64(&endpointId, 1))
-	}
-
-	server.RegisterName(endpoint, rcvr)
-	return endpoint
 }

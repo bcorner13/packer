@@ -3,13 +3,14 @@
 package googlecompute
 
 import (
+	"context"
 	"fmt"
 	"log"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 )
 
 // The unique ID for this builder.
@@ -28,15 +29,14 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 		return warnings, errs
 	}
 	b.config = c
-
 	return warnings, nil
 }
 
 // Run executes a googlecompute Packer build and returns a packer.Artifact
 // representing a GCE machine image.
-func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packer.Artifact, error) {
+func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (packer.Artifact, error) {
 	driver, err := NewDriverGCE(
-		ui, b.config.ProjectId, &b.config.account)
+		ui, b.config.ProjectId, b.config.Account)
 	if err != nil {
 		return nil, err
 	}
@@ -58,50 +58,48 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 		&StepCreateInstance{
 			Debug: b.config.PackerDebug,
 		},
+		&StepCreateWindowsPassword{
+			Debug:        b.config.PackerDebug,
+			DebugKeyPath: fmt.Sprintf("gce_windows_%s.pem", b.config.PackerBuildName),
+		},
 		&StepInstanceInfo{
 			Debug: b.config.PackerDebug,
 		},
 		&communicator.StepConnect{
-			Config:    &b.config.Comm,
-			Host:      commHost,
-			SSHConfig: sshConfig,
+			Config:      &b.config.Comm,
+			Host:        communicator.CommHost(b.config.Comm.SSHHost, "instance_ip"),
+			SSHConfig:   b.config.Comm.SSHConfigFunc(),
+			WinRMConfig: winrmConfig,
 		},
 		new(common.StepProvision),
-		new(StepTeardownInstance),
-		new(StepCreateImage),
+		&common.StepCleanupTempKeys{
+			Comm: &b.config.Comm,
+		},
 	}
+	if _, exists := b.config.Metadata[StartupScriptKey]; exists || b.config.StartupScriptFile != "" {
+		steps = append(steps, new(StepWaitStartupScript))
+	}
+	steps = append(steps, new(StepTeardownInstance), new(StepCreateImage))
 
 	// Run the steps.
-	if b.config.PackerDebug {
-		b.runner = &multistep.DebugRunner{
-			Steps:   steps,
-			PauseFn: common.MultistepDebugFn(ui),
-		}
-	} else {
-		b.runner = &multistep.BasicRunner{Steps: steps}
-	}
-	b.runner.Run(state)
+	b.runner = common.NewRunner(steps, b.config.PackerConfig, ui)
+	b.runner.Run(ctx, state)
 
 	// Report any errors.
 	if rawErr, ok := state.GetOk("error"); ok {
 		return nil, rawErr.(error)
 	}
-	if _, ok := state.GetOk("image_name"); !ok {
-		log.Println("Failed to find image_name in state. Bug?")
+	if _, ok := state.GetOk("image"); !ok {
+		log.Println("Failed to find image in state. Bug?")
 		return nil, nil
 	}
 
 	artifact := &Artifact{
-		imageName: state.Get("image_name").(string),
-		driver:    driver,
+		image:  state.Get("image").(*Image),
+		driver: driver,
+		config: b.config,
 	}
 	return artifact, nil
 }
 
 // Cancel.
-func (b *Builder) Cancel() {
-	if b.runner != nil {
-		log.Println("Cancelling the step runner...")
-		b.runner.Cancel()
-	}
-}

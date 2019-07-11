@@ -1,6 +1,7 @@
 package testing
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -8,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template"
 )
 
 // TestEnvVar must be set to a non-empty value for acceptance tests to run.
@@ -145,13 +146,12 @@ func Test(t TestT, c TestCase) {
 	// Run it! We use a temporary directory for caching and discard
 	// any UI output. We discard since it shows up in logs anyways.
 	log.Printf("[DEBUG] Running 'test' build")
-	cache := &packer.FileCache{CacheDir: os.TempDir()}
 	ui := &packer.BasicUi{
 		Reader:      os.Stdin,
 		Writer:      ioutil.Discard,
 		ErrorWriter: ioutil.Discard,
 	}
-	artifacts, err := build.Run(ui, cache)
+	artifacts, err := build.Run(context.Background(), ui)
 	if err != nil {
 		t.Fatal(fmt.Sprintf("Run error:\n\n%s", err))
 		goto TEARDOWN

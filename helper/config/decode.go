@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/packer/template/interpolate"
 	"github.com/mitchellh/mapstructure"
-	"github.com/mitchellh/packer/template/interpolate"
 )
 
 // DecodeOpts are the options for decoding configuration.
@@ -23,6 +23,14 @@ type DecodeOpts struct {
 	Interpolate        bool
 	InterpolateContext *interpolate.Context
 	InterpolateFilter  *interpolate.RenderFilter
+
+	DecodeHooks []mapstructure.DecodeHookFunc
+}
+
+var DefaultDecodeHookFuncs = []mapstructure.DecodeHookFunc{
+	uint8ToStringHook,
+	mapstructure.StringToSliceHookFunc(","),
+	mapstructure.StringToTimeDurationHookFunc(),
 }
 
 // Decode decodes the configuration into the target and optionally
@@ -60,17 +68,18 @@ func Decode(target interface{}, config *DecodeOpts, raws ...interface{}) error {
 		}
 	}
 
+	decodeHookFuncs := DefaultDecodeHookFuncs
+	if len(config.DecodeHooks) != 0 {
+		decodeHookFuncs = config.DecodeHooks
+	}
+
 	// Build our decoder
 	var md mapstructure.Metadata
 	decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
 		Result:           target,
 		Metadata:         &md,
 		WeaklyTypedInput: true,
-		DecodeHook: mapstructure.ComposeDecodeHookFunc(
-			uint8ToStringHook,
-			mapstructure.StringToSliceHookFunc(","),
-			mapstructure.StringToTimeDurationHookFunc(),
-		),
+		DecodeHook:       mapstructure.ComposeDecodeHookFunc(decodeHookFuncs...),
 	})
 	if err != nil {
 		return err
@@ -108,10 +117,11 @@ func Decode(target interface{}, config *DecodeOpts, raws ...interface{}) error {
 // detecting things like user variables from the raw configuration params.
 func DetectContext(raws ...interface{}) (*interpolate.Context, error) {
 	var s struct {
-		BuildName    string            `mapstructure:"packer_build_name"`
-		BuildType    string            `mapstructure:"packer_builder_type"`
-		TemplatePath string            `mapstructure:"packer_template_path"`
-		Vars         map[string]string `mapstructure:"packer_user_variables"`
+		BuildName     string            `mapstructure:"packer_build_name"`
+		BuildType     string            `mapstructure:"packer_builder_type"`
+		TemplatePath  string            `mapstructure:"packer_template_path"`
+		Vars          map[string]string `mapstructure:"packer_user_variables"`
+		SensitiveVars []string          `mapstructure:"packer_sensitive_variables"`
 	}
 
 	for _, r := range raws {
@@ -121,10 +131,11 @@ func DetectContext(raws ...interface{}) (*interpolate.Context, error) {
 	}
 
 	return &interpolate.Context{
-		BuildName:     s.BuildName,
-		BuildType:     s.BuildType,
-		TemplatePath:  s.TemplatePath,
-		UserVariables: s.Vars,
+		BuildName:          s.BuildName,
+		BuildType:          s.BuildType,
+		TemplatePath:       s.TemplatePath,
+		UserVariables:      s.Vars,
+		SensitiveVariables: s.SensitiveVars,
 	}, nil
 }
 

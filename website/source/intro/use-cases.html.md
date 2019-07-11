@@ -1,16 +1,14 @@
 ---
-description: |
-    By now you should know what Packer does and what the benefits of image creation
-    are. In this section, we'll enumerate *some* of the use cases for Packer. Note
-    that this is not an exhaustive list by any means. There are definitely use cases
-    for Packer not listed here. This list is just meant to give you an idea of how
-    Packer may improve your processes.
 layout: intro
-next_title: Supported Platforms
-next_url: '/intro/platforms.html'
-page_title: Use Cases
-prev_url: '/intro/why.html'
-...
+sidebar_current: intro-use-cases
+page_title: Use Cases - Introduction
+description: |-
+  By now you should know what Packer does and what the benefits of image
+  creation are. In this section, we'll enumerate *some* of the use cases for
+  Packer. Note that this is not an exhaustive list by any means. There are
+  definitely use cases for Packer not listed here. This list is just meant to
+  give you an idea of how Packer may improve your processes.
+---
 
 # Use Cases
 
@@ -29,7 +27,7 @@ change to Chef/Puppet.
 
 As part of this pipeline, the newly created images can then be launched and
 tested, verifying the infrastructure changes work. If the tests pass, you can be
-confident that that image will work when deployed. This brings a new level of
+confident that the image will work when deployed. This brings a new level of
 stability and testability to infrastructure changes.
 
 ### Dev/Prod Parity

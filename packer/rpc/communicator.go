@@ -1,13 +1,15 @@
 package rpc
 
 import (
+	"context"
 	"encoding/gob"
 	"io"
 	"log"
 	"net/rpc"
 	"os"
+	"sync"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 )
 
 // An implementation of packer.Communicator where the communicator is actually
@@ -44,6 +46,7 @@ type CommunicatorDownloadArgs struct {
 type CommunicatorUploadArgs struct {
 	Path           string
 	ReaderStreamId uint32
+	FileInfo       *fileInfo
 }
 
 type CommunicatorUploadDirArgs struct {
@@ -62,23 +65,35 @@ func Communicator(client *rpc.Client) *communicator {
 	return &communicator{client: client}
 }
 
-func (c *communicator) Start(cmd *packer.RemoteCmd) (err error) {
+func (c *communicator) Start(ctx context.Context, cmd *packer.RemoteCmd) (err error) {
 	var args CommunicatorStartArgs
 	args.Command = cmd.Command
 
+	var wg sync.WaitGroup
+
 	if cmd.Stdin != nil {
 		args.StdinStreamId = c.mux.NextId()
-		go serveSingleCopy("stdin", c.mux, args.StdinStreamId, nil, cmd.Stdin)
+		go func() {
+			serveSingleCopy("stdin", c.mux, args.StdinStreamId, nil, cmd.Stdin)
+		}()
 	}
 
 	if cmd.Stdout != nil {
+		wg.Add(1)
 		args.StdoutStreamId = c.mux.NextId()
-		go serveSingleCopy("stdout", c.mux, args.StdoutStreamId, cmd.Stdout, nil)
+		go func() {
+			defer wg.Done()
+			serveSingleCopy("stdout", c.mux, args.StdoutStreamId, cmd.Stdout, nil)
+		}()
 	}
 
 	if cmd.Stderr != nil {
+		wg.Add(1)
 		args.StderrStreamId = c.mux.NextId()
-		go serveSingleCopy("stderr", c.mux, args.StderrStreamId, cmd.Stderr, nil)
+		go func() {
+			defer wg.Done()
+			serveSingleCopy("stderr", c.mux, args.StderrStreamId, cmd.Stderr, nil)
+		}()
 	}
 
 	responseStreamId := c.mux.NextId()
@@ -86,6 +101,7 @@ func (c *communicator) Start(cmd *packer.RemoteCmd) (err error) {
 
 	go func() {
 		conn, err := c.mux.Accept(responseStreamId)
+		wg.Wait()
 		if err != nil {
 			log.Printf("[ERR] Error accepting response stream %d: %s",
 				responseStreamId, err)
@@ -119,6 +135,10 @@ func (c *communicator) Upload(path string, r io.Reader, fi *os.FileInfo) (err er
 	args := CommunicatorUploadArgs{
 		Path:           path,
 		ReaderStreamId: streamId,
+	}
+
+	if fi != nil {
+		args.FileInfo = NewFileInfo(*fi)
 	}
 
 	err = c.client.Call("Communicator.Upload", &args, new(interface{}))
@@ -182,6 +202,8 @@ func (c *communicator) Download(path string, w io.Writer) (err error) {
 }
 
 func (c *CommunicatorServer) Start(args *CommunicatorStartArgs, reply *interface{}) error {
+	ctx := context.TODO()
+
 	// Build the RemoteCmd on this side so that it all pipes over
 	// to the remote side.
 	var cmd packer.RemoteCmd
@@ -241,7 +263,7 @@ func (c *CommunicatorServer) Start(args *CommunicatorStartArgs, reply *interface
 	responseWriter := gob.NewEncoder(responseC)
 
 	// Start the actual command
-	err = c.c.Start(&cmd)
+	err = c.c.Start(ctx, &cmd)
 	if err != nil {
 		close(doneCh)
 		return NewBasicError(err)
@@ -253,8 +275,8 @@ func (c *CommunicatorServer) Start(args *CommunicatorStartArgs, reply *interface
 		defer close(doneCh)
 		defer responseC.Close()
 		cmd.Wait()
-		log.Printf("[INFO] RPC endpoint: Communicator ended with: %d", cmd.ExitStatus)
-		responseWriter.Encode(&CommandFinished{cmd.ExitStatus})
+		log.Printf("[INFO] RPC endpoint: Communicator ended with: %d", cmd.ExitStatus())
+		responseWriter.Encode(&CommandFinished{cmd.ExitStatus()})
 	}()
 
 	return nil
@@ -267,7 +289,12 @@ func (c *CommunicatorServer) Upload(args *CommunicatorUploadArgs, reply *interfa
 	}
 	defer readerC.Close()
 
-	err = c.c.Upload(args.Path, readerC, nil)
+	var fi *os.FileInfo
+	if args.FileInfo != nil {
+		fi = new(os.FileInfo)
+		*fi = *args.FileInfo
+	}
+	err = c.c.Upload(args.Path, readerC, fi)
 	return
 }
 

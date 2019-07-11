@@ -5,15 +5,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 )
 
 func testConfig() map[string]interface{} {
 	return map[string]interface{}{
-		"api_token": "bar",
-		"region":    "nyc2",
-		"size":      "512mb",
-		"image":     "foo",
+		"api_token":    "bar",
+		"region":       "nyc2",
+		"size":         "512mb",
+		"ssh_username": "root",
+		"image":        "foo",
 	}
 }
 
@@ -151,39 +152,6 @@ func TestBuilderPrepare_Image(t *testing.T) {
 	}
 }
 
-func TestBuilderPrepare_SSHUsername(t *testing.T) {
-	var b Builder
-	config := testConfig()
-
-	// Test default
-	warnings, err := b.Prepare(config)
-	if len(warnings) > 0 {
-		t.Fatalf("bad: %#v", warnings)
-	}
-	if err != nil {
-		t.Fatalf("should not have error: %s", err)
-	}
-
-	if b.config.Comm.SSHUsername != "root" {
-		t.Errorf("invalid: %s", b.config.Comm.SSHUsername)
-	}
-
-	// Test set
-	config["ssh_username"] = "foo"
-	b = Builder{}
-	warnings, err = b.Prepare(config)
-	if len(warnings) > 0 {
-		t.Fatalf("bad: %#v", warnings)
-	}
-	if err != nil {
-		t.Fatalf("should not have error: %s", err)
-	}
-
-	if b.config.Comm.SSHUsername != "foo" {
-		t.Errorf("invalid: %s", b.config.Comm.SSHUsername)
-	}
-}
-
 func TestBuilderPrepare_StateTimeout(t *testing.T) {
 	var b Builder
 	config := testConfig()
@@ -222,7 +190,46 @@ func TestBuilderPrepare_StateTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("should have error")
 	}
+}
 
+func TestBuilderPrepare_SnapshotTimeout(t *testing.T) {
+	var b Builder
+	config := testConfig()
+
+	// Test default
+	warnings, err := b.Prepare(config)
+	if len(warnings) > 0 {
+		t.Fatalf("bad: %#v", warnings)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
+	}
+
+	if b.config.SnapshotTimeout != 60*time.Minute {
+		t.Errorf("invalid: %s", b.config.SnapshotTimeout)
+	}
+
+	// Test set
+	config["snapshot_timeout"] = "15m"
+	b = Builder{}
+	warnings, err = b.Prepare(config)
+	if len(warnings) > 0 {
+		t.Fatalf("bad: %#v", warnings)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
+	}
+
+	// Test bad
+	config["snapshot_timeout"] = "badstring"
+	b = Builder{}
+	warnings, err = b.Prepare(config)
+	if len(warnings) > 0 {
+		t.Fatalf("bad: %#v", warnings)
+	}
+	if err == nil {
+		t.Fatal("should have error")
+	}
 }
 
 func TestBuilderPrepare_PrivateNetworking(t *testing.T) {

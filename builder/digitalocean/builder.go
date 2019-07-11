@@ -4,15 +4,16 @@
 package digitalocean
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/url"
 
 	"github.com/digitalocean/godo"
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 	"golang.org/x/oauth2"
 )
 
@@ -34,7 +35,7 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 	return nil, nil
 }
 
-func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packer.Artifact, error) {
+func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (packer.Artifact, error) {
 	client := godo.NewClient(oauth2.NewClient(oauth2.NoContext, &apiTokenSource{
 		AccessToken: b.config.APIToken,
 	}))
@@ -46,9 +47,31 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 		client.BaseURL = u
 	}
 
+	if len(b.config.SnapshotRegions) > 0 {
+		opt := &godo.ListOptions{
+			Page:    1,
+			PerPage: 200,
+		}
+		regions, _, err := client.Regions.List(context.TODO(), opt)
+		if err != nil {
+			return nil, fmt.Errorf("DigitalOcean: Unable to get regions, %s", err)
+		}
+
+		validRegions := make(map[string]struct{})
+		for _, val := range regions {
+			validRegions[val.Slug] = struct{}{}
+		}
+
+		for _, region := range append(b.config.SnapshotRegions, b.config.Region) {
+			if _, ok := validRegions[region]; !ok {
+				return nil, fmt.Errorf("DigitalOcean: Invalid region, %s", region)
+			}
+		}
+	}
+
 	// Set up the state
 	state := new(multistep.BasicStateBag)
-	state.Put("config", b.config)
+	state.Put("config", &b.config)
 	state.Put("client", client)
 	state.Put("hook", hook)
 	state.Put("ui", ui)
@@ -63,26 +86,23 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 		new(stepDropletInfo),
 		&communicator.StepConnect{
 			Config:    &b.config.Comm,
-			Host:      commHost,
-			SSHConfig: sshConfig,
+			Host:      communicator.CommHost(b.config.Comm.SSHHost, "droplet_ip"),
+			SSHConfig: b.config.Comm.SSHConfigFunc(),
 		},
 		new(common.StepProvision),
+		&common.StepCleanupTempKeys{
+			Comm: &b.config.Comm,
+		},
 		new(stepShutdown),
 		new(stepPowerOff),
-		new(stepSnapshot),
+		&stepSnapshot{
+			snapshotTimeout: b.config.SnapshotTimeout,
+		},
 	}
 
 	// Run the steps
-	if b.config.PackerDebug {
-		b.runner = &multistep.DebugRunner{
-			Steps:   steps,
-			PauseFn: common.MultistepDebugFn(ui),
-		}
-	} else {
-		b.runner = &multistep.BasicRunner{Steps: steps}
-	}
-
-	b.runner.Run(state)
+	b.runner = common.NewRunner(steps, b.config.PackerConfig, ui)
+	b.runner.Run(ctx, state)
 
 	// If there was an error, return that
 	if rawErr, ok := state.GetOk("error"); ok {
@@ -95,18 +115,11 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 	}
 
 	artifact := &Artifact{
-		snapshotName: state.Get("snapshot_name").(string),
-		snapshotId:   state.Get("snapshot_image_id").(int),
-		regionName:   state.Get("region").(string),
-		client:       client,
+		SnapshotName: state.Get("snapshot_name").(string),
+		SnapshotId:   state.Get("snapshot_image_id").(int),
+		RegionNames:  state.Get("regions").([]string),
+		Client:       client,
 	}
 
 	return artifact, nil
-}
-
-func (b *Builder) Cancel() {
-	if b.runner != nil {
-		log.Println("Cancelling the step runner...")
-		b.runner.Cancel()
-	}
 }

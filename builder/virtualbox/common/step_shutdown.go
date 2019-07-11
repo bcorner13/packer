@@ -1,12 +1,14 @@
 package common
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
 	"log"
 	"time"
+
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 )
 
 // This step shuts down the machine. It first attempts to do so gracefully,
@@ -23,9 +25,10 @@ import (
 type StepShutdown struct {
 	Command string
 	Timeout time.Duration
+	Delay   time.Duration
 }
 
-func (s *StepShutdown) Run(state multistep.StateBag) multistep.StepAction {
+func (s *StepShutdown) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
 	comm := state.Get("communicator").(packer.Communicator)
 	driver := state.Get("driver").(Driver)
 	ui := state.Get("ui").(packer.Ui)
@@ -35,7 +38,7 @@ func (s *StepShutdown) Run(state multistep.StateBag) multistep.StepAction {
 		ui.Say("Gracefully halting virtual machine...")
 		log.Printf("Executing shutdown command: %s", s.Command)
 		cmd := &packer.RemoteCmd{Command: s.Command}
-		if err := cmd.StartWithUi(comm, ui); err != nil {
+		if err := cmd.RunWithUi(ctx, comm, ui); err != nil {
 			err := fmt.Errorf("Failed to send shutdown command: %s", err)
 			state.Put("error", err)
 			ui.Error(err.Error())
@@ -48,6 +51,12 @@ func (s *StepShutdown) Run(state multistep.StateBag) multistep.StepAction {
 		for {
 			running, _ := driver.IsRunning(vmName)
 			if !running {
+
+				if s.Delay.Nanoseconds() > 0 {
+					log.Printf("Delay for %s after shutdown to allow locks to clear...", s.Delay)
+					time.Sleep(s.Delay)
+				}
+
 				break
 			}
 

@@ -1,13 +1,13 @@
 package qemu
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"math/rand"
-	"net"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/common/net"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 )
 
 // This step adds a NAT port forwarding definition so that SSH is available
@@ -16,36 +16,30 @@ import (
 // Uses:
 //
 // Produces:
-type stepForwardSSH struct{}
+type stepForwardSSH struct {
+	l *net.Listener
+}
 
-func (s *stepForwardSSH) Run(state multistep.StateBag) multistep.StepAction {
+func (s *stepForwardSSH) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
 	config := state.Get("config").(*Config)
 	ui := state.Get("ui").(packer.Ui)
 
 	log.Printf("Looking for available communicator (SSH, WinRM, etc) port between %d and %d", config.SSHHostPortMin, config.SSHHostPortMax)
-	var sshHostPort uint
-	var offset uint = 0
-
-	portRange := int(config.SSHHostPortMax - config.SSHHostPortMin)
-	if portRange > 0 {
-		// Have to check if > 0 to avoid a panic
-		offset = uint(rand.Intn(portRange))
+	var err error
+	s.l, err = net.ListenRangeConfig{
+		Addr:    config.VNCBindAddress,
+		Min:     config.SSHHostPortMin,
+		Max:     config.SSHHostPortMax,
+		Network: "tcp",
+	}.Listen(ctx)
+	if err != nil {
+		err := fmt.Errorf("Error finding port: %s", err)
+		state.Put("error", err)
+		ui.Error(err.Error())
+		return multistep.ActionHalt
 	}
-
-	for {
-		sshHostPort = offset + config.SSHHostPortMin
-		if sshHostPort >= config.SSHHostPortMax {
-			offset = 0
-			sshHostPort = config.SSHHostPortMin
-		}
-		log.Printf("Trying port: %d", sshHostPort)
-		l, err := net.Listen("tcp", fmt.Sprintf(":%d", sshHostPort))
-		if err == nil {
-			defer l.Close()
-			break
-		}
-		offset++
-	}
+	s.l.Listener.Close() // free port, but don't unlock lock file
+	sshHostPort := s.l.Port
 	ui.Say(fmt.Sprintf("Found port for communicator (SSH, WinRM, etc): %d.", sshHostPort))
 
 	// Save the port we're using so that future steps can use it
@@ -54,4 +48,11 @@ func (s *stepForwardSSH) Run(state multistep.StateBag) multistep.StepAction {
 	return multistep.ActionContinue
 }
 
-func (s *stepForwardSSH) Cleanup(state multistep.StateBag) {}
+func (s *stepForwardSSH) Cleanup(state multistep.StateBag) {
+	if s.l != nil {
+		err := s.l.Close()
+		if err != nil {
+			log.Printf("failed to unlock port lockfile: %v", err)
+		}
+	}
+}

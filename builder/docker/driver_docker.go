@@ -12,8 +12,8 @@ import (
 	"sync"
 
 	"github.com/hashicorp/go-version"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 type DockerDriver struct {
@@ -42,11 +42,24 @@ func (d *DockerDriver) DeleteImage(id string) error {
 	return nil
 }
 
-func (d *DockerDriver) Commit(id string) (string, error) {
+func (d *DockerDriver) Commit(id string, author string, changes []string, message string) (string, error) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	cmd := exec.Command("docker", "commit", id)
+	args := []string{"commit"}
+	if author != "" {
+		args = append(args, "--author", author)
+	}
+	for _, change := range changes {
+		args = append(args, "--change", change)
+	}
+	if message != "" {
+		args = append(args, "--message", message)
+	}
+	args = append(args, id)
+
+	log.Printf("Committing container with args: %v", args)
+	cmd := exec.Command("docker", args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -83,11 +96,23 @@ func (d *DockerDriver) Export(id string, dst io.Writer) error {
 	return nil
 }
 
-func (d *DockerDriver) Import(path string, repo string) (string, error) {
-	var stdout bytes.Buffer
-	cmd := exec.Command("docker", "import", "-", repo)
+func (d *DockerDriver) Import(path string, changes []string, repo string) (string, error) {
+	var stdout, stderr bytes.Buffer
+
+	args := []string{"import"}
+
+	for _, change := range changes {
+		args = append(args, "--change", change)
+	}
+
+	args = append(args, "-")
+	args = append(args, repo)
+
+	cmd := exec.Command("docker", args...)
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	stdin, err := cmd.StdinPipe()
+
 	if err != nil {
 		return "", err
 	}
@@ -99,6 +124,8 @@ func (d *DockerDriver) Import(path string, repo string) (string, error) {
 	}
 	defer file.Close()
 
+	log.Printf("Importing tarball with args: %v", args)
+
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
@@ -109,8 +136,7 @@ func (d *DockerDriver) Import(path string, repo string) (string, error) {
 	}()
 
 	if err := cmd.Wait(); err != nil {
-		err = fmt.Errorf("Error importing container: %s", err)
-		return "", err
+		return "", fmt.Errorf("Error importing container: %s\n\nStderr: %s", err, stderr.String())
 	}
 
 	return strings.TrimSpace(stdout.String()), nil
@@ -133,30 +159,59 @@ func (d *DockerDriver) IPAddress(id string) (string, error) {
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-func (d *DockerDriver) Login(repo, email, user, pass string) error {
+func (d *DockerDriver) Login(repo, user, pass string) error {
 	d.l.Lock()
 
-	args := []string{"login"}
-	if email != "" {
-		args = append(args, "-e", email)
-	}
-	if user != "" {
-		args = append(args, "-u", user)
-	}
-	if pass != "" {
-		args = append(args, "-p", pass)
-	}
-	if repo != "" {
-		args = append(args, repo)
-	}
-
-	cmd := exec.Command("docker", args...)
-	err := runAndStream(cmd, d.Ui)
+	version_running, err := d.Version()
 	if err != nil {
 		d.l.Unlock()
+		return err
 	}
 
-	return err
+	// Version 17.07.0 of Docker adds support for the new
+	// `--password-stdin` option which can be used to offer
+	// password via the standard input, rather than passing
+	// the password and/or token using a command line switch.
+	constraint, err := version.NewConstraint(">= 17.07.0")
+	if err != nil {
+		d.l.Unlock()
+		return err
+	}
+
+	cmd := exec.Command("docker")
+	cmd.Args = append(cmd.Args, "login")
+
+	if user != "" {
+		cmd.Args = append(cmd.Args, "-u", user)
+	}
+
+	if pass != "" {
+		if constraint.Check(version_running) {
+			cmd.Args = append(cmd.Args, "--password-stdin")
+
+			stdin, err := cmd.StdinPipe()
+			if err != nil {
+				d.l.Unlock()
+				return err
+			}
+			io.WriteString(stdin, pass)
+			stdin.Close()
+		} else {
+			cmd.Args = append(cmd.Args, "-p", pass)
+		}
+	}
+
+	if repo != "" {
+		cmd.Args = append(cmd.Args, repo)
+	}
+
+	err = runAndStream(cmd, d.Ui)
+	if err != nil {
+		d.l.Unlock()
+		return err
+	}
+
+	return nil
 }
 
 func (d *DockerDriver) Logout(repo string) error {
@@ -205,16 +260,19 @@ func (d *DockerDriver) StartContainer(config *ContainerConfig) (string, error) {
 	// Build up the template data
 	var tplData startContainerTemplate
 	tplData.Image = config.Image
-	ctx := *d.Ctx
-	ctx.Data = &tplData
+	ictx := *d.Ctx
+	ictx.Data = &tplData
 
 	// Args that we're going to pass to Docker
 	args := []string{"run"}
+	if config.Privileged {
+		args = append(args, "--privileged")
+	}
 	for host, guest := range config.Volumes {
 		args = append(args, "-v", fmt.Sprintf("%s:%s", host, guest))
 	}
 	for _, v := range config.RunCommand {
-		v, err := interpolate.Render(v, &ctx)
+		v, err := interpolate.Render(v, &ictx)
 		if err != nil {
 			return "", err
 		}
@@ -250,6 +308,13 @@ func (d *DockerDriver) StartContainer(config *ContainerConfig) (string, error) {
 }
 
 func (d *DockerDriver) StopContainer(id string) error {
+	if err := exec.Command("docker", "stop", id).Run(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *DockerDriver) KillContainer(id string) error {
 	if err := exec.Command("docker", "kill", id).Run(); err != nil {
 		return err
 	}
@@ -259,8 +324,34 @@ func (d *DockerDriver) StopContainer(id string) error {
 
 func (d *DockerDriver) TagImage(id string, repo string, force bool) error {
 	args := []string{"tag"}
+
+	// detect running docker version before tagging
+	// flag `force` for docker tagging was removed after Docker 1.12.0
+	// to keep its backward compatibility, we are not going to remove `force`
+	// option, but to ignore it when Docker version >= 1.12.0
+	//
+	// for more detail, please refer to the following links:
+	// - https://docs.docker.com/engine/deprecated/#/f-flag-on-docker-tag
+	// - https://github.com/docker/docker/pull/23090
+	version_running, err := d.Version()
+	if err != nil {
+		return err
+	}
+
+	version_deprecated, err := version.NewVersion("1.12.0")
+	if err != nil {
+		// should never reach this line
+		return err
+	}
+
 	if force {
-		args = append(args, "-f")
+		if version_running.LessThan(version_deprecated) {
+			args = append(args, "-f")
+		} else {
+			// do nothing if Docker version >= 1.12.0
+			log.Printf("[WARN] option: \"force\" will be ignored here")
+			log.Printf("since it was removed after Docker 1.12.0 released")
+		}
 	}
 	args = append(args, id, repo)
 

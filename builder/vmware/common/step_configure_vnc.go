@@ -1,15 +1,14 @@
 package common
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math/rand"
-	"net"
-	"os"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/common/net"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 )
 
 // This step configures the VM to enable the VNC server.
@@ -19,55 +18,71 @@ import (
 //   vmx_path string
 //
 // Produces:
-//   vnc_port uint - The port that VNC is configured to listen on.
+//   vnc_port int - The port that VNC is configured to listen on.
 type StepConfigureVNC struct {
-	VNCPortMin uint
-	VNCPortMax uint
+	Enabled            bool
+	VNCBindAddress     string
+	VNCPortMin         int
+	VNCPortMax         int
+	VNCDisablePassword bool
+
+	l *net.Listener
 }
 
 type VNCAddressFinder interface {
-	VNCAddress(uint, uint) (string, uint, error)
+	VNCAddress(context.Context, string, int, int) (string, int, error)
+
+	// UpdateVMX, sets driver specific VNC values to VMX data.
+	UpdateVMX(vncAddress, vncPassword string, vncPort int, vmxData map[string]string)
 }
 
-func (StepConfigureVNC) VNCAddress(portMin, portMax uint) (string, uint, error) {
-	// Find an open VNC port. Note that this can still fail later on
-	// because we have to release the port at some point. But this does its
-	// best.
-	var vncPort uint
-	portRange := int(portMax - portMin)
-	for {
-		if portRange > 0 {
-			vncPort = uint(rand.Intn(portRange)) + portMin
-		} else {
-			vncPort = portMin
-		}
-
-		log.Printf("Trying port: %d", vncPort)
-		l, err := net.Listen("tcp", fmt.Sprintf(":%d", vncPort))
-		if err == nil {
-			defer l.Close()
-			break
-		}
+func (s *StepConfigureVNC) VNCAddress(ctx context.Context, vncBindAddress string, portMin, portMax int) (string, int, error) {
+	var err error
+	s.l, err = net.ListenRangeConfig{
+		Addr:    s.VNCBindAddress,
+		Min:     s.VNCPortMin,
+		Max:     s.VNCPortMax,
+		Network: "tcp",
+	}.Listen(ctx)
+	if err != nil {
+		return "", 0, err
 	}
-	return "127.0.0.1", vncPort, nil
+
+	s.l.Listener.Close() // free port, but don't unlock lock file
+	return s.l.Address, s.l.Port, nil
 }
 
-func (s *StepConfigureVNC) Run(state multistep.StateBag) multistep.StepAction {
+func VNCPassword(skipPassword bool) string {
+	if skipPassword {
+		return ""
+	}
+	length := int(8)
+
+	charSet := []byte("012345689abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	charSetLength := len(charSet)
+
+	password := make([]byte, length)
+
+	for i := 0; i < length; i++ {
+		password[i] = charSet[rand.Intn(charSetLength)]
+	}
+
+	return string(password)
+}
+
+func (s *StepConfigureVNC) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
+	if !s.Enabled {
+		log.Println("Skipping VNC configuration step...")
+		return multistep.ActionContinue
+	}
+
 	driver := state.Get("driver").(Driver)
 	ui := state.Get("ui").(packer.Ui)
 	vmxPath := state.Get("vmx_path").(string)
 
-	f, err := os.Open(vmxPath)
+	vmxData, err := ReadVMX(vmxPath)
 	if err != nil {
-		err := fmt.Errorf("Error reading VMX data: %s", err)
-		state.Put("error", err)
-		ui.Error(err.Error())
-		return multistep.ActionHalt
-	}
-
-	vmxBytes, err := ioutil.ReadAll(f)
-	if err != nil {
-		err := fmt.Errorf("Error reading VMX data: %s", err)
+		err := fmt.Errorf("Error reading VMX file: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
@@ -79,19 +94,21 @@ func (s *StepConfigureVNC) Run(state multistep.StateBag) multistep.StepAction {
 	} else {
 		vncFinder = s
 	}
+
 	log.Printf("Looking for available port between %d and %d", s.VNCPortMin, s.VNCPortMax)
-	vncIp, vncPort, err := vncFinder.VNCAddress(s.VNCPortMin, s.VNCPortMax)
+	vncBindAddress, vncPort, err := vncFinder.VNCAddress(ctx, s.VNCBindAddress, s.VNCPortMin, s.VNCPortMax)
+
 	if err != nil {
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
 	}
 
-	log.Printf("Found available VNC port: %d", vncPort)
+	vncPassword := VNCPassword(s.VNCDisablePassword)
 
-	vmxData := ParseVMX(string(vmxBytes))
-	vmxData["remotedisplay.vnc.enabled"] = "TRUE"
-	vmxData["remotedisplay.vnc.port"] = fmt.Sprintf("%d", vncPort)
+	log.Printf("Found available VNC port: %s:%d", vncBindAddress, vncPort)
+
+	vncFinder.UpdateVMX(vncBindAddress, vncPassword, vncPort, vmxData)
 
 	if err := WriteVMX(vmxPath, vmxData); err != nil {
 		err := fmt.Errorf("Error writing VMX data: %s", err)
@@ -101,10 +118,25 @@ func (s *StepConfigureVNC) Run(state multistep.StateBag) multistep.StepAction {
 	}
 
 	state.Put("vnc_port", vncPort)
-	state.Put("vnc_ip", vncIp)
+	state.Put("vnc_ip", vncBindAddress)
+	state.Put("vnc_password", vncPassword)
 
 	return multistep.ActionContinue
 }
 
-func (StepConfigureVNC) Cleanup(multistep.StateBag) {
+func (*StepConfigureVNC) UpdateVMX(address, password string, port int, data map[string]string) {
+	data["remotedisplay.vnc.enabled"] = "TRUE"
+	data["remotedisplay.vnc.port"] = fmt.Sprintf("%d", port)
+	data["remotedisplay.vnc.ip"] = address
+	if len(password) > 0 {
+		data["remotedisplay.vnc.password"] = password
+	}
+}
+
+func (s *StepConfigureVNC) Cleanup(multistep.StateBag) {
+	if s.l != nil {
+		if err := s.l.Close(); err != nil {
+			log.Printf("failed to unlock port lockfile: %v", err)
+		}
+	}
 }

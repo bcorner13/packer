@@ -1,26 +1,24 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License. See the LICENSE file in builder/azure for license information.
-
 package arm
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/builder/azure/common/constants"
+	"github.com/hashicorp/packer/builder/azure/common/constants"
+	"github.com/hashicorp/packer/helper/multistep"
 )
 
 func TestStepDeleteResourceGroupShouldFailIfDeleteFails(t *testing.T) {
 	var testSubject = &StepDeleteResourceGroup{
-		delete: func(string) error { return fmt.Errorf("!! Unit Test FAIL !!") },
+		delete: func(context.Context, multistep.StateBag, string) error { return fmt.Errorf("!! Unit Test FAIL !!") },
 		say:    func(message string) {},
 		error:  func(e error) {},
 	}
 
 	stateBag := DeleteTestStateBagStepDeleteResourceGroup()
 
-	var result = testSubject.Run(stateBag)
+	var result = testSubject.Run(context.Background(), stateBag)
 	if result != multistep.ActionHalt {
 		t.Fatalf("Expected the step to return 'ActionHalt', but got '%d'.", result)
 	}
@@ -32,14 +30,14 @@ func TestStepDeleteResourceGroupShouldFailIfDeleteFails(t *testing.T) {
 
 func TestStepDeleteResourceGroupShouldPassIfDeletePasses(t *testing.T) {
 	var testSubject = &StepDeleteResourceGroup{
-		delete: func(string) error { return nil },
+		delete: func(context.Context, multistep.StateBag, string) error { return nil },
 		say:    func(message string) {},
 		error:  func(e error) {},
 	}
 
 	stateBag := DeleteTestStateBagStepDeleteResourceGroup()
 
-	var result = testSubject.Run(stateBag)
+	var result = testSubject.Run(context.Background(), stateBag)
 	if result != multistep.ActionContinue {
 		t.Fatalf("Expected the step to return 'ActionContinue', but got '%d'.", result)
 	}
@@ -49,12 +47,9 @@ func TestStepDeleteResourceGroupShouldPassIfDeletePasses(t *testing.T) {
 	}
 }
 
-func TestStepDeleteResourceGroupShouldTakeStepArgumentsFromStateBag(t *testing.T) {
-	var actualResourceGroupName string
-
+func TestStepDeleteResourceGroupShouldDeleteStateBagArmResourceGroupCreated(t *testing.T) {
 	var testSubject = &StepDeleteResourceGroup{
-		delete: func(resourceGroupName string) error {
-			actualResourceGroupName = resourceGroupName
+		delete: func(context.Context, multistep.StateBag, string) error {
 			return nil
 		},
 		say:   func(message string) {},
@@ -62,22 +57,22 @@ func TestStepDeleteResourceGroupShouldTakeStepArgumentsFromStateBag(t *testing.T
 	}
 
 	stateBag := DeleteTestStateBagStepDeleteResourceGroup()
-	var result = testSubject.Run(stateBag)
+	testSubject.Run(context.Background(), stateBag)
 
-	if result != multistep.ActionContinue {
-		t.Fatalf("Expected the step to return 'ActionContinue', but got '%d'.", result)
+	value, ok := stateBag.GetOk(constants.ArmIsResourceGroupCreated)
+	if !ok {
+		t.Fatal("Expected the resource bag value arm.IsResourceGroupCreated to exist")
 	}
 
-	var expectedResourceGroupName = stateBag.Get(constants.ArmResourceGroupName).(string)
-
-	if actualResourceGroupName != expectedResourceGroupName {
-		t.Fatalf("Expected the step to source 'constants.ArmResourceGroupName' from the state bag, but it did not.")
+	if value.(bool) {
+		t.Fatalf("Expected arm.IsResourceGroupCreated to be false, but got %q", value)
 	}
 }
 
 func DeleteTestStateBagStepDeleteResourceGroup() multistep.StateBag {
 	stateBag := new(multistep.BasicStateBag)
 	stateBag.Put(constants.ArmResourceGroupName, "Unit Test: ResourceGroupName")
+	stateBag.Put(constants.ArmIsResourceGroupCreated, "Unit Test: IsResourceGroupCreated")
 
 	return stateBag
 }

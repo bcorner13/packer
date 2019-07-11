@@ -1,14 +1,14 @@
 package common
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"math/rand"
-	"net"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/common/net"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
 )
 
 // This step adds a NAT port forwarding definition so that SSH is available
@@ -22,43 +22,45 @@ import (
 // Produces:
 type StepForwardSSH struct {
 	CommConfig     *communicator.Config
-	HostPortMin    uint
-	HostPortMax    uint
+	HostPortMin    int
+	HostPortMax    int
 	SkipNatMapping bool
+
+	l *net.Listener
 }
 
-func (s *StepForwardSSH) Run(state multistep.StateBag) multistep.StepAction {
+func (s *StepForwardSSH) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
 	driver := state.Get("driver").(Driver)
 	ui := state.Get("ui").(packer.Ui)
 	vmName := state.Get("vmName").(string)
+
+	if s.CommConfig.Type == "none" {
+		log.Printf("Not using a communicator, skipping setting up port forwarding...")
+		state.Put("sshHostPort", 0)
+		return multistep.ActionContinue
+	}
 
 	guestPort := s.CommConfig.Port()
 	sshHostPort := guestPort
 	if !s.SkipNatMapping {
 		log.Printf("Looking for available communicator (SSH, WinRM, etc) port between %d and %d",
 			s.HostPortMin, s.HostPortMax)
-		offset := 0
 
-		portRange := int(s.HostPortMax - s.HostPortMin)
-		if portRange > 0 {
-			// Have to check if > 0 to avoid a panic
-			offset = rand.Intn(portRange)
+		var err error
+		s.l, err = net.ListenRangeConfig{
+			Addr:    "127.0.0.1",
+			Min:     s.HostPortMin,
+			Max:     s.HostPortMax,
+			Network: "tcp",
+		}.Listen(ctx)
+		if err != nil {
+			err := fmt.Errorf("Error creating port forwarding rule: %s", err)
+			state.Put("error", err)
+			ui.Error(err.Error())
+			return multistep.ActionHalt
 		}
-
-		for {
-			sshHostPort = offset + int(s.HostPortMin)
-			if sshHostPort >= int(s.HostPortMax) {
-				offset = 0
-				sshHostPort = int(s.HostPortMin)
-			}
-			log.Printf("Trying port: %d", sshHostPort)
-			l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", sshHostPort))
-			if err == nil {
-				defer l.Close()
-				break
-			}
-			offset++
-		}
+		s.l.Listener.Close() // free port, but don't unlock lock file
+		sshHostPort = s.l.Port
 
 		// Create a forwarded port mapping to the VM
 		ui.Say(fmt.Sprintf("Creating forwarded port mapping for communicator (SSH, WinRM, etc) (host port %d)", sshHostPort))
@@ -81,4 +83,11 @@ func (s *StepForwardSSH) Run(state multistep.StateBag) multistep.StepAction {
 	return multistep.ActionContinue
 }
 
-func (s *StepForwardSSH) Cleanup(state multistep.StateBag) {}
+func (s *StepForwardSSH) Cleanup(state multistep.StateBag) {
+	if s.l != nil {
+		err := s.l.Close()
+		if err != nil {
+			log.Printf("failed to unlock port lockfile: %v", err)
+		}
+	}
+}

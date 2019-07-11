@@ -1,11 +1,12 @@
 package saltmasterless
 
 import (
-	"github.com/mitchellh/packer/packer"
 	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/hashicorp/packer/packer"
 )
 
 func testConfig() map[string]interface{} {
@@ -31,7 +32,7 @@ func TestProvisionerPrepare_Defaults(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
-	if p.config.TempConfigDir != DefaultTempConfigDir {
+	if p.config.TempConfigDir != p.guestOSTypeConfig.tempDir {
 		t.Errorf("unexpected temp config dir: %s", p.config.TempConfigDir)
 	}
 }
@@ -45,6 +46,30 @@ func TestProvisionerPrepare_InvalidKey(t *testing.T) {
 	err := p.Prepare(config)
 	if err == nil {
 		t.Fatal("should have error")
+	}
+}
+
+func TestProvisionerPrepare_CustomState(t *testing.T) {
+	var p Provisioner
+	config := testConfig()
+
+	err := p.Prepare(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if !strings.Contains(p.config.CmdArgs, "state.") {
+		t.Fatal("a state should be specified in CmdArgs")
+	}
+
+	config["custom_state"] = "birb"
+	err = p.Prepare(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if !strings.Contains(p.config.CmdArgs, "state.sls birb") {
+		t.Fatal("birb state should be specified in CmdArgs")
 	}
 }
 
@@ -92,6 +117,29 @@ func TestProvisionerPrepare_MinionConfig_RemotePillarRoots(t *testing.T) {
 	err := p.Prepare(config)
 	if err == nil {
 		t.Fatal("minion_config and remote_pillar_roots should cause error")
+	}
+}
+
+func TestProvisionerPrepare_GrainsFile(t *testing.T) {
+	var p Provisioner
+	config := testConfig()
+
+	config["grains_file"] = "/i/dont/exist/i/think"
+	err := p.Prepare(config)
+	if err == nil {
+		t.Fatal("should have error")
+	}
+
+	tf, err := ioutil.TempFile("", "grains")
+	if err != nil {
+		t.Fatalf("error tempfile: %s", err)
+	}
+	defer os.Remove(tf.Name())
+
+	config["grains_file"] = tf.Name()
+	err = p.Prepare(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
 	}
 }
 
@@ -259,5 +307,21 @@ func TestProvisionerPrepare_LogLevel(t *testing.T) {
 
 	if !strings.Contains(p.config.CmdArgs, "-l debug") {
 		t.Fatal("-l debug should be set in CmdArgs")
+	}
+}
+
+func TestProvisionerPrepare_GuestOSType(t *testing.T) {
+	var p Provisioner
+	config := testConfig()
+
+	config["guest_os_type"] = "Windows"
+
+	err := p.Prepare(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if p.config.GuestOSType != "windows" {
+		t.Fatalf("GuestOSType should be 'windows'")
 	}
 }

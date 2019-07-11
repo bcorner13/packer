@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License. See the LICENSE file in builder/azure for license information.
-
 package arm
 
 import (
@@ -8,6 +5,10 @@ import (
 
 	"golang.org/x/crypto/ssh"
 )
+
+func TestFart(t *testing.T) {
+
+}
 
 func TestAuthorizedKeyShouldParse(t *testing.T) {
 	testSubject, err := NewOpenSshKeyPairWithSize(512)

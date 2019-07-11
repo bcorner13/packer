@@ -1,15 +1,18 @@
 package file
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/helper/config"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 type Config struct {
@@ -24,6 +27,9 @@ type Config struct {
 
 	// Direction
 	Direction string
+
+	// False if the sources have to exist.
+	Generated bool
 
 	ctx interpolate.Context
 }
@@ -60,7 +66,7 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 
 	if p.config.Direction == "upload" {
 		for _, src := range p.config.Sources {
-			if _, err := os.Stat(src); err != nil {
+			if _, err := os.Stat(src); p.config.Generated == false && err != nil {
 				errs = packer.MultiErrorAppend(errs,
 					fmt.Errorf("Bad source '%s': %s", src, err))
 			}
@@ -84,7 +90,7 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 	return nil
 }
 
-func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
+func (p *Provisioner) Provision(ctx context.Context, ui packer.Ui, comm packer.Communicator) error {
 	if p.config.Direction == "download" {
 		return p.ProvisionDownload(ui, comm)
 	} else {
@@ -94,24 +100,38 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 
 func (p *Provisioner) ProvisionDownload(ui packer.Ui, comm packer.Communicator) error {
 	for _, src := range p.config.Sources {
-		ui.Say(fmt.Sprintf("Downloading %s => %s", src, p.config.Destination))
-
-		if strings.HasSuffix(p.config.Destination, "/") {
-			err := os.MkdirAll(p.config.Destination, os.FileMode(0755))
+		dst := p.config.Destination
+		ui.Say(fmt.Sprintf("Downloading %s => %s", src, dst))
+		// ensure destination dir exists.  p.config.Destination may either be a file or a dir.
+		dir := dst
+		// if it doesn't end with a /, set dir as the parent dir
+		if !strings.HasSuffix(dst, "/") {
+			dir = filepath.Dir(dir)
+		} else if !strings.HasSuffix(src, "/") && !strings.HasSuffix(src, "*") {
+			dst = filepath.Join(dst, filepath.Base(src))
+		}
+		if dir != "" {
+			err := os.MkdirAll(dir, os.FileMode(0755))
 			if err != nil {
 				return err
 			}
-			return comm.DownloadDir(src, p.config.Destination, nil)
+		}
+		// if the src was a dir, download the dir
+		if strings.HasSuffix(src, "/") || strings.ContainsAny(src, "*?[") {
+			return comm.DownloadDir(src, dst, nil)
 		}
 
-		f, err := os.OpenFile(p.config.Destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
 
-		err = comm.Download(src, f)
-		if err != nil {
+		// Create MultiWriter for the current progress
+		pf := io.MultiWriter(f)
+
+		// Download the file
+		if err = comm.Download(src, pf); err != nil {
 			ui.Error(fmt.Sprintf("Download failed: %s", err))
 			return err
 		}
@@ -121,7 +141,9 @@ func (p *Provisioner) ProvisionDownload(ui packer.Ui, comm packer.Communicator) 
 
 func (p *Provisioner) ProvisionUpload(ui packer.Ui, comm packer.Communicator) error {
 	for _, src := range p.config.Sources {
-		ui.Say(fmt.Sprintf("Uploading %s => %s", src, p.config.Destination))
+		dst := p.config.Destination
+
+		ui.Say(fmt.Sprintf("Uploading %s => %s", src, dst))
 
 		info, err := os.Stat(src)
 		if err != nil {
@@ -145,17 +167,23 @@ func (p *Provisioner) ProvisionUpload(ui packer.Ui, comm packer.Communicator) er
 			return err
 		}
 
-		err = comm.Upload(p.config.Destination, f, &fi)
-		if err != nil {
+		if strings.HasSuffix(dst, "/") {
+			dst = dst + filepath.Base(src)
+		}
+
+		pf := ui.TrackProgress(filepath.Base(src), 0, info.Size(), f)
+		defer pf.Close()
+
+		// Upload the file
+		if err = comm.Upload(dst, pf, &fi); err != nil {
+			if strings.Contains(err.Error(), "Error restoring file") {
+				ui.Error(fmt.Sprintf("Upload failed: %s; this can occur when "+
+					"your file destination is a folder without a trailing "+
+					"slash.", err))
+			}
 			ui.Error(fmt.Sprintf("Upload failed: %s", err))
 			return err
 		}
 	}
 	return nil
-}
-
-func (p *Provisioner) Cancel() {
-	// Just hard quit. It isn't a big deal if what we're doing keeps
-	// running on the other side.
-	os.Exit(0)
 }

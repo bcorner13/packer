@@ -1,17 +1,28 @@
 package common
 
 import (
-	"github.com/mitchellh/packer/template/interpolate"
+	"fmt"
+
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 type VBoxVersionConfig struct {
-	VBoxVersionFile string `mapstructure:"virtualbox_version_file"`
+	Communicator    string  `mapstructure:"communicator"`
+	VBoxVersionFile *string `mapstructure:"virtualbox_version_file"`
 }
 
 func (c *VBoxVersionConfig) Prepare(ctx *interpolate.Context) []error {
-	if c.VBoxVersionFile == "" {
-		c.VBoxVersionFile = ".vbox_version"
+	var errs []error
+
+	if c.VBoxVersionFile == nil {
+		default_file := ".vbox_version"
+		c.VBoxVersionFile = &default_file
 	}
 
-	return nil
+	if c.Communicator == "none" && *c.VBoxVersionFile != "" {
+		errs = append(errs, fmt.Errorf("virtualbox_version_file has to be an "+
+			"empty string when communicator = 'none'."))
+	}
+
+	return errs
 }

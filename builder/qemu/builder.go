@@ -1,6 +1,7 @@
 package qemu
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -10,21 +11,25 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/common"
-	"github.com/mitchellh/packer/helper/communicator"
-	"github.com/mitchellh/packer/helper/config"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/packer/common/bootcommand"
+	"github.com/hashicorp/packer/helper/communicator"
+	"github.com/hashicorp/packer/helper/config"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 const BuilderId = "transcend.qemu"
 
 var accels = map[string]struct{}{
-	"none": struct{}{},
-	"kvm":  struct{}{},
-	"tcg":  struct{}{},
-	"xen":  struct{}{},
+	"none": {},
+	"kvm":  {},
+	"tcg":  {},
+	"xen":  {},
+	"hax":  {},
+	"hvf":  {},
+	"whpx": {},
 }
 
 var netDevice = map[string]bool{
@@ -72,41 +77,54 @@ var diskDiscard = map[string]bool{
 	"ignore": true,
 }
 
+var diskDZeroes = map[string]bool{
+	"unmap": true,
+	"on":    true,
+	"off":   true,
+}
+
 type Builder struct {
 	config Config
 	runner multistep.Runner
 }
 
 type Config struct {
-	common.PackerConfig `mapstructure:",squash"`
-	common.HTTPConfig   `mapstructure:",squash"`
-	common.ISOConfig    `mapstructure:",squash"`
-	Comm                communicator.Config `mapstructure:",squash"`
+	common.PackerConfig   `mapstructure:",squash"`
+	common.HTTPConfig     `mapstructure:",squash"`
+	common.ISOConfig      `mapstructure:",squash"`
+	bootcommand.VNCConfig `mapstructure:",squash"`
+	Comm                  communicator.Config `mapstructure:",squash"`
+	common.FloppyConfig   `mapstructure:",squash"`
 
-	ISOSkipCache    bool       `mapstructure:"iso_skip_cache"`
-	Accelerator     string     `mapstructure:"accelerator"`
-	BootCommand     []string   `mapstructure:"boot_command"`
-	DiskInterface   string     `mapstructure:"disk_interface"`
-	DiskSize        uint       `mapstructure:"disk_size"`
-	DiskCache       string     `mapstructure:"disk_cache"`
-	DiskDiscard     string     `mapstructure:"disk_discard"`
-	SkipCompaction  bool       `mapstructure:"skip_compaction"`
-	DiskCompression bool       `mapstructure:"disk_compression"`
-	FloppyFiles     []string   `mapstructure:"floppy_files"`
-	Format          string     `mapstructure:"format"`
-	Headless        bool       `mapstructure:"headless"`
-	DiskImage       bool       `mapstructure:"disk_image"`
-	MachineType     string     `mapstructure:"machine_type"`
-	NetDevice       string     `mapstructure:"net_device"`
-	OutputDir       string     `mapstructure:"output_directory"`
-	QemuArgs        [][]string `mapstructure:"qemuargs"`
-	QemuBinary      string     `mapstructure:"qemu_binary"`
-	ShutdownCommand string     `mapstructure:"shutdown_command"`
-	SSHHostPortMin  uint       `mapstructure:"ssh_host_port_min"`
-	SSHHostPortMax  uint       `mapstructure:"ssh_host_port_max"`
-	VNCPortMin      uint       `mapstructure:"vnc_port_min"`
-	VNCPortMax      uint       `mapstructure:"vnc_port_max"`
-	VMName          string     `mapstructure:"vm_name"`
+	ISOSkipCache       bool       `mapstructure:"iso_skip_cache"`
+	Accelerator        string     `mapstructure:"accelerator"`
+	CpuCount           int        `mapstructure:"cpus"`
+	AdditionalDiskSize []string   `mapstructure:"disk_additional_size"`
+	DiskInterface      string     `mapstructure:"disk_interface"`
+	DiskSize           uint       `mapstructure:"disk_size"`
+	DiskCache          string     `mapstructure:"disk_cache"`
+	DiskDiscard        string     `mapstructure:"disk_discard"`
+	DetectZeroes       string     `mapstructure:"disk_detect_zeroes"`
+	SkipCompaction     bool       `mapstructure:"skip_compaction"`
+	DiskCompression    bool       `mapstructure:"disk_compression"`
+	Format             string     `mapstructure:"format"`
+	Headless           bool       `mapstructure:"headless"`
+	DiskImage          bool       `mapstructure:"disk_image"`
+	UseBackingFile     bool       `mapstructure:"use_backing_file"`
+	MachineType        string     `mapstructure:"machine_type"`
+	MemorySize         int        `mapstructure:"memory"`
+	NetDevice          string     `mapstructure:"net_device"`
+	OutputDir          string     `mapstructure:"output_directory"`
+	QemuArgs           [][]string `mapstructure:"qemuargs"`
+	QemuBinary         string     `mapstructure:"qemu_binary"`
+	ShutdownCommand    string     `mapstructure:"shutdown_command"`
+	SSHHostPortMin     int        `mapstructure:"ssh_host_port_min"`
+	SSHHostPortMax     int        `mapstructure:"ssh_host_port_max"`
+	UseDefaultDisplay  bool       `mapstructure:"use_default_display"`
+	VNCBindAddress     string     `mapstructure:"vnc_bind_address"`
+	VNCPortMin         int        `mapstructure:"vnc_port_min"`
+	VNCPortMax         int        `mapstructure:"vnc_port_max"`
+	VMName             string     `mapstructure:"vm_name"`
 
 	// These are deprecated, but we keep them around for BC
 	// TODO(@mitchellh): remove
@@ -115,10 +133,8 @@ type Config struct {
 	// TODO(mitchellh): deprecate
 	RunOnce bool `mapstructure:"run_once"`
 
-	RawBootWait        string `mapstructure:"boot_wait"`
 	RawShutdownTimeout string `mapstructure:"shutdown_timeout"`
 
-	bootWait        time.Duration ``
 	shutdownTimeout time.Duration ``
 	ctx             interpolate.Context
 }
@@ -138,8 +154,11 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 		return nil, err
 	}
 
+	var errs *packer.MultiError
+	warnings := make([]string, 0)
+
 	if b.config.DiskSize == 0 {
-		b.config.DiskSize = 40000
+		b.config.DiskSize = 40960
 	}
 
 	if b.config.DiskCache == "" {
@@ -150,12 +169,28 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 		b.config.DiskDiscard = "ignore"
 	}
 
+	if b.config.DetectZeroes == "" {
+		b.config.DetectZeroes = "off"
+	}
+
 	if b.config.Accelerator == "" {
 		if runtime.GOOS == "windows" {
 			b.config.Accelerator = "tcg"
 		} else {
-			b.config.Accelerator = "kvm"
+			// /dev/kvm is a kernel module that may be loaded if kvm is
+			// installed and the host supports VT-x extensions. To make sure
+			// this will actually work we need to os.Open() it. If os.Open fails
+			// the kernel module was not installed or loaded correctly.
+			if fp, err := os.Open("/dev/kvm"); err != nil {
+				b.config.Accelerator = "tcg"
+			} else {
+				fp.Close()
+				b.config.Accelerator = "kvm"
+			}
 		}
+		log.Printf("use detected accelerator: %s", b.config.Accelerator)
+	} else {
+		log.Printf("use specified accelerator: %s", b.config.Accelerator)
 	}
 
 	if b.config.MachineType == "" {
@@ -170,8 +205,14 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 		b.config.QemuBinary = "qemu-system-x86_64"
 	}
 
-	if b.config.RawBootWait == "" {
-		b.config.RawBootWait = "10s"
+	if b.config.MemorySize < 10 {
+		log.Printf("MemorySize %d is too small, using default: 512", b.config.MemorySize)
+		b.config.MemorySize = 512
+	}
+
+	if b.config.CpuCount < 1 {
+		log.Printf("CpuCount %d too small, using default: 1", b.config.CpuCount)
+		b.config.CpuCount = 1
 	}
 
 	if b.config.SSHHostPortMin == 0 {
@@ -180,6 +221,10 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 
 	if b.config.SSHHostPortMax == 0 {
 		b.config.SSHHostPortMax = 4444
+	}
+
+	if b.config.VNCBindAddress == "" {
+		b.config.VNCBindAddress = "127.0.0.1"
 	}
 
 	if b.config.VNCPortMin == 0 {
@@ -198,9 +243,8 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 		b.config.Format = "qcow2"
 	}
 
-	if b.config.FloppyFiles == nil {
-		b.config.FloppyFiles = make([]string, 0)
-	}
+	errs = packer.MultiErrorAppend(errs, b.config.FloppyConfig.Prepare(&b.config.ctx)...)
+	errs = packer.MultiErrorAppend(errs, b.config.VNCConfig.Prepare(&b.config.ctx)...)
 
 	if b.config.NetDevice == "" {
 		b.config.NetDevice = "virtio-net"
@@ -214,9 +258,6 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 	if b.config.SSHWaitTimeout != 0 {
 		b.config.Comm.SSHTimeout = b.config.SSHWaitTimeout
 	}
-
-	var errs *packer.MultiError
-	warnings := make([]string, 0)
 
 	if b.config.ISOSkipCache {
 		b.config.ISOChecksumType = "none"
@@ -241,9 +282,19 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 		b.config.DiskCompression = false
 	}
 
+	if b.config.UseBackingFile && !(b.config.DiskImage && b.config.Format == "qcow2") {
+		errs = packer.MultiErrorAppend(
+			errs, errors.New("use_backing_file can only be enabled for QCOW2 images and when disk_image is true"))
+	}
+
+	if b.config.DiskImage && len(b.config.AdditionalDiskSize) > 0 {
+		errs = packer.MultiErrorAppend(
+			errs, errors.New("disk_additional_size can only be used when disk_image is false"))
+	}
+
 	if _, ok := accels[b.config.Accelerator]; !ok {
 		errs = packer.MultiErrorAppend(
-			errs, errors.New("invalid accelerator, only 'kvm', 'tcg', 'xen', or 'none' are allowed"))
+			errs, errors.New("invalid accelerator, only 'kvm', 'tcg', 'xen', 'hax', 'hvf', 'whpx', or 'none' are allowed"))
 	}
 
 	if _, ok := netDevice[b.config.NetDevice]; !ok {
@@ -263,7 +314,12 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 
 	if _, ok := diskDiscard[b.config.DiskDiscard]; !ok {
 		errs = packer.MultiErrorAppend(
-			errs, errors.New("unrecognized disk cache type"))
+			errs, errors.New("unrecognized disk discard type"))
+	}
+
+	if _, ok := diskDZeroes[b.config.DetectZeroes]; !ok {
+		errs = packer.MultiErrorAppend(
+			errs, errors.New("unrecognized disk detect zeroes setting"))
 	}
 
 	if !b.config.PackerForce {
@@ -272,12 +328,6 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 				errs,
 				fmt.Errorf("Output directory '%s' already exists. It must not exist.", b.config.OutputDir))
 		}
-	}
-
-	b.config.bootWait, err = time.ParseDuration(b.config.RawBootWait)
-	if err != nil {
-		errs = packer.MultiErrorAppend(
-			errs, fmt.Errorf("Failed parsing boot_wait: %s", err))
 	}
 
 	if b.config.RawShutdownTimeout == "" {
@@ -293,6 +343,10 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 	if b.config.SSHHostPortMin > b.config.SSHHostPortMax {
 		errs = packer.MultiErrorAppend(
 			errs, errors.New("ssh_host_port_min must be less than ssh_host_port_max"))
+	}
+	if b.config.SSHHostPortMin < 0 {
+		errs = packer.MultiErrorAppend(
+			errs, errors.New("ssh_host_port_min must be positive"))
 	}
 
 	if b.config.VNCPortMin > b.config.VNCPortMax {
@@ -311,7 +365,7 @@ func (b *Builder) Prepare(raws ...interface{}) ([]string, error) {
 	return warnings, nil
 }
 
-func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packer.Artifact, error) {
+func (b *Builder) Run(ctx context.Context, ui packer.Ui, hook packer.Hook) (packer.Artifact, error) {
 	// Create the driver that we'll use to communicate with Qemu
 	driver, err := b.newDriver(b.config.QemuBinary)
 	if err != nil {
@@ -333,7 +387,7 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 			Checksum:     b.config.ISOChecksum,
 			ChecksumType: b.config.ISOChecksumType,
 			Description:  "ISO",
-			Extension:    "iso",
+			Extension:    b.config.TargetExtension,
 			ResultKey:    "iso_path",
 			TargetPath:   b.config.TargetPath,
 			Url:          b.config.ISOUrls,
@@ -349,7 +403,8 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 
 	steps = append(steps, new(stepPrepareOutputDir),
 		&common.StepCreateFloppy{
-			Files: b.config.FloppyFiles,
+			Files:       b.config.FloppyConfig.FloppyFiles,
+			Directories: b.config.FloppyConfig.FloppyDirectories,
 		},
 		new(stepCreateDisk),
 		new(stepCopyDisk),
@@ -359,41 +414,60 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 			HTTPPortMin: b.config.HTTPPortMin,
 			HTTPPortMax: b.config.HTTPPortMax,
 		},
-		new(stepForwardSSH),
+	)
+
+	if b.config.Comm.Type != "none" {
+		steps = append(steps,
+			new(stepForwardSSH),
+		)
+	}
+
+	steps = append(steps,
 		new(stepConfigureVNC),
 		steprun,
-		&stepBootWait{},
 		&stepTypeBootCommand{},
-		&communicator.StepConnect{
-			Config:    &b.config.Comm,
-			Host:      commHost,
-			SSHConfig: sshConfig,
-			SSHPort:   commPort,
-		},
+	)
+
+	if b.config.Comm.Type != "none" {
+		steps = append(steps,
+			&communicator.StepConnect{
+				Config:    &b.config.Comm,
+				Host:      commHost(b.config.Comm.SSHHost),
+				SSHConfig: b.config.Comm.SSHConfigFunc(),
+				SSHPort:   commPort,
+				WinRMPort: commPort,
+			},
+		)
+	}
+
+	steps = append(steps,
 		new(common.StepProvision),
+	)
+
+	steps = append(steps,
+		&common.StepCleanupTempKeys{
+			Comm: &b.config.Comm,
+		},
+	)
+	steps = append(steps,
 		new(stepShutdown),
+	)
+
+	steps = append(steps,
 		new(stepConvertDisk),
 	)
 
 	// Setup the state bag
 	state := new(multistep.BasicStateBag)
-	state.Put("cache", cache)
 	state.Put("config", &b.config)
+	state.Put("debug", b.config.PackerDebug)
 	state.Put("driver", driver)
 	state.Put("hook", hook)
 	state.Put("ui", ui)
 
 	// Run
-	if b.config.PackerDebug {
-		b.runner = &multistep.DebugRunner{
-			Steps:   steps,
-			PauseFn: common.MultistepDebugFn(ui),
-		}
-	} else {
-		b.runner = &multistep.BasicRunner{Steps: steps}
-	}
-
-	b.runner.Run(state)
+	b.runner = common.NewRunnerWithPauseFn(steps, b.config.PackerConfig, ui, state)
+	b.runner.Run(ctx, state)
 
 	// If there was an error, return that
 	if rawErr, ok := state.GetOk("error"); ok {
@@ -412,11 +486,14 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 	// Compile the artifact list
 	files := make([]string, 0, 5)
 	visit := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
 		if !info.IsDir() {
 			files = append(files, path)
 		}
 
-		return err
+		return nil
 	}
 
 	if err := filepath.Walk(b.config.OutputDir, visit); err != nil {
@@ -429,19 +506,16 @@ func (b *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (packe
 		state: make(map[string]interface{}),
 	}
 
-	artifact.state["diskName"] = state.Get("disk_filename").(string)
+	artifact.state["diskName"] = b.config.VMName
+	diskpaths, ok := state.Get("qemu_disk_paths").([]string)
+	if ok {
+		artifact.state["diskPaths"] = diskpaths
+	}
 	artifact.state["diskType"] = b.config.Format
 	artifact.state["diskSize"] = uint64(b.config.DiskSize)
 	artifact.state["domainType"] = b.config.Accelerator
 
 	return artifact, nil
-}
-
-func (b *Builder) Cancel() {
-	if b.runner != nil {
-		log.Println("Cancelling the step runner...")
-		b.runner.Cancel()
-	}
 }
 
 func (b *Builder) newDriver(qemuBinary string) (Driver, error) {

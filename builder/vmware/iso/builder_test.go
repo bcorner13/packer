@@ -1,12 +1,13 @@
 package iso
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
 
-	"github.com/mitchellh/packer/packer"
+	"github.com/hashicorp/packer/packer"
 )
 
 func testConfig() map[string]interface{} {
@@ -106,7 +107,8 @@ func TestBuilderPrepare_FloppyFiles(t *testing.T) {
 		t.Fatalf("bad: %#v", b.config.FloppyFiles)
 	}
 
-	config["floppy_files"] = []string{"foo", "bar"}
+	floppies_path := "../../../common/test-fixtures/floppies"
+	config["floppy_files"] = []string{fmt.Sprintf("%s/bar.bat", floppies_path), fmt.Sprintf("%s/foo.ps1", floppies_path)}
 	b = Builder{}
 	warns, err = b.Prepare(config)
 	if len(warns) > 0 {
@@ -116,9 +118,112 @@ func TestBuilderPrepare_FloppyFiles(t *testing.T) {
 		t.Fatalf("should not have error: %s", err)
 	}
 
-	expected := []string{"foo", "bar"}
+	expected := []string{fmt.Sprintf("%s/bar.bat", floppies_path), fmt.Sprintf("%s/foo.ps1", floppies_path)}
 	if !reflect.DeepEqual(b.config.FloppyFiles, expected) {
 		t.Fatalf("bad: %#v", b.config.FloppyFiles)
+	}
+}
+
+func TestBuilderPrepare_InvalidFloppies(t *testing.T) {
+	var b Builder
+	config := testConfig()
+	config["floppy_files"] = []string{"nonexistent.bat", "nonexistent.ps1"}
+	b = Builder{}
+	_, errs := b.Prepare(config)
+	if errs == nil {
+		t.Fatalf("Nonexistent floppies should trigger multierror")
+	}
+
+	if len(errs.(*packer.MultiError).Errors) != 2 {
+		t.Fatalf("Multierror should work and report 2 errors")
+	}
+}
+
+func TestBuilderPrepare_RemoteType(t *testing.T) {
+	var b Builder
+	config := testConfig()
+
+	config["format"] = "ovf"
+	config["remote_host"] = "foobar.example.com"
+	config["remote_password"] = "supersecret"
+	config["skip_validate_credentials"] = true
+	// Bad
+	config["remote_type"] = "foobar"
+	warns, err := b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err == nil {
+		t.Fatal("should have error")
+	}
+
+	config["remote_type"] = "esx5"
+	// Bad
+	config["remote_host"] = ""
+	b = Builder{}
+	warns, err = b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err == nil {
+		t.Fatal("should have error")
+	}
+
+	// Good
+	config["remote_type"] = ""
+	config["format"] = ""
+	config["remote_host"] = ""
+	config["remote_password"] = ""
+	config["remote_private_key_file"] = ""
+	b = Builder{}
+	warns, err = b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
+	}
+
+	// Good
+	config["remote_type"] = "esx5"
+	config["remote_host"] = "foobar.example.com"
+	config["remote_password"] = "supersecret"
+	b = Builder{}
+	warns, err = b.Prepare(config)
+	if len(warns) > 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
+	}
+}
+
+func TestBuilderPrepare_RemoteExport(t *testing.T) {
+	var b Builder
+	config := testConfig()
+
+	config["remote_type"] = "esx5"
+	config["remote_host"] = "foobar.example.com"
+	config["skip_validate_credentials"] = true
+	// Bad
+	config["remote_password"] = ""
+	warns, err := b.Prepare(config)
+	if len(warns) != 0 {
+		t.Fatalf("bad: %#v", warns)
+	}
+	if err == nil {
+		t.Fatal("should have error")
+	}
+
+	// Good
+	config["remote_password"] = "supersecret"
+	b = Builder{}
+	warns, err = b.Prepare(config)
+	if len(warns) != 0 {
+		t.Fatalf("err: %s", err)
+	}
+	if err != nil {
+		t.Fatalf("should not have error: %s", err)
 	}
 }
 
@@ -141,6 +246,11 @@ func TestBuilderPrepare_Format(t *testing.T) {
 	for _, format := range goodFormats {
 		// Good
 		config["format"] = format
+		config["remote_type"] = "esx5"
+		config["remote_host"] = "hosty.hostface"
+		config["remote_password"] = "password"
+		config["skip_validate_credentials"] = true
+
 		b = Builder{}
 		warns, err = b.Prepare(config)
 		if len(warns) > 0 {
@@ -336,5 +446,88 @@ func TestBuilderPrepare_VNCPort(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("should not have error: %s", err)
+	}
+}
+
+func TestBuilderCheckCollisions(t *testing.T) {
+	config := testConfig()
+	config["vmx_data"] = map[string]string{
+		"no.collision":    "awesomesauce",
+		"ide0:0.fileName": "is a collision",
+		"displayName":     "also a collision",
+	}
+	{
+		var b Builder
+		warns, _ := b.Prepare(config)
+		if len(warns) != 1 {
+			t.Fatalf("Should have warning about two collisions.")
+		}
+	}
+	{
+		config["vmx_template_path"] = "some/path.vmx"
+		var b Builder
+		warns, _ := b.Prepare(config)
+		if len(warns) != 0 {
+			t.Fatalf("Should not check for collisions with custom template.")
+		}
+	}
+
+}
+
+func TestBuilderPrepare_CommConfig(t *testing.T) {
+	// Test Winrm
+	{
+		config := testConfig()
+		config["communicator"] = "winrm"
+		config["winrm_username"] = "username"
+		config["winrm_password"] = "password"
+		config["winrm_host"] = "1.2.3.4"
+
+		var b Builder
+		warns, err := b.Prepare(config)
+		if len(warns) > 0 {
+			t.Fatalf("bad: %#v", warns)
+		}
+		if err != nil {
+			t.Fatalf("should not have error: %s", err)
+		}
+
+		if b.config.SSHConfig.Comm.WinRMUser != "username" {
+			t.Errorf("bad winrm_username: %s", b.config.SSHConfig.Comm.WinRMUser)
+		}
+		if b.config.SSHConfig.Comm.WinRMPassword != "password" {
+			t.Errorf("bad winrm_password: %s", b.config.SSHConfig.Comm.WinRMPassword)
+		}
+		if host := b.config.SSHConfig.Comm.Host(); host != "1.2.3.4" {
+			t.Errorf("bad host: %s", host)
+		}
+	}
+
+	// Test SSH
+	{
+		config := testConfig()
+		config["communicator"] = "ssh"
+		config["ssh_username"] = "username"
+		config["ssh_password"] = "password"
+		config["ssh_host"] = "1.2.3.4"
+
+		var b Builder
+		warns, err := b.Prepare(config)
+		if len(warns) > 0 {
+			t.Fatalf("bad: %#v", warns)
+		}
+		if err != nil {
+			t.Fatalf("should not have error: %s", err)
+		}
+
+		if b.config.SSHConfig.Comm.SSHUsername != "username" {
+			t.Errorf("bad ssh_username: %s", b.config.SSHConfig.Comm.SSHUsername)
+		}
+		if b.config.SSHConfig.Comm.SSHPassword != "password" {
+			t.Errorf("bad ssh_password: %s", b.config.SSHConfig.Comm.SSHPassword)
+		}
+		if host := b.config.SSHConfig.Comm.Host(); host != "1.2.3.4" {
+			t.Errorf("bad host: %s", host)
+		}
 	}
 }

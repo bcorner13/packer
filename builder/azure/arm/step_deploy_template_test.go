@@ -1,26 +1,26 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License. See the LICENSE file in builder/azure for license information.
-
 package arm
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/builder/azure/common/constants"
+	"github.com/hashicorp/packer/builder/azure/common/constants"
+	"github.com/hashicorp/packer/helper/multistep"
 )
 
 func TestStepDeployTemplateShouldFailIfDeployFails(t *testing.T) {
 	var testSubject = &StepDeployTemplate{
-		deploy: func(string, string, *TemplateParameters) error { return fmt.Errorf("!! Unit Test FAIL !!") },
-		say:    func(message string) {},
-		error:  func(e error) {},
+		deploy: func(context.Context, string, string) error {
+			return fmt.Errorf("!! Unit Test FAIL !!")
+		},
+		say:   func(message string) {},
+		error: func(e error) {},
 	}
 
 	stateBag := createTestStateBagStepDeployTemplate()
 
-	var result = testSubject.Run(stateBag)
+	var result = testSubject.Run(context.Background(), stateBag)
 	if result != multistep.ActionHalt {
 		t.Fatalf("Expected the step to return 'ActionHalt', but got '%d'.", result)
 	}
@@ -32,14 +32,14 @@ func TestStepDeployTemplateShouldFailIfDeployFails(t *testing.T) {
 
 func TestStepDeployTemplateShouldPassIfDeployPasses(t *testing.T) {
 	var testSubject = &StepDeployTemplate{
-		deploy: func(string, string, *TemplateParameters) error { return nil },
+		deploy: func(context.Context, string, string) error { return nil },
 		say:    func(message string) {},
 		error:  func(e error) {},
 	}
 
 	stateBag := createTestStateBagStepDeployTemplate()
 
-	var result = testSubject.Run(stateBag)
+	var result = testSubject.Run(context.Background(), stateBag)
 	if result != multistep.ActionContinue {
 		t.Fatalf("Expected the step to return 'ActionContinue', but got '%d'.", result)
 	}
@@ -52,41 +52,59 @@ func TestStepDeployTemplateShouldPassIfDeployPasses(t *testing.T) {
 func TestStepDeployTemplateShouldTakeStepArgumentsFromStateBag(t *testing.T) {
 	var actualResourceGroupName string
 	var actualDeploymentName string
-	var actualTemplateParameters *TemplateParameters
 
 	var testSubject = &StepDeployTemplate{
-		deploy: func(resourceGroupName string, deploymentName string, templateParameter *TemplateParameters) error {
+		deploy: func(ctx context.Context, resourceGroupName string, deploymentName string) error {
 			actualResourceGroupName = resourceGroupName
 			actualDeploymentName = deploymentName
-			actualTemplateParameters = templateParameter
 
 			return nil
 		},
 		say:   func(message string) {},
 		error: func(e error) {},
+		name:  "--deployment-name--",
 	}
 
 	stateBag := createTestStateBagStepValidateTemplate()
-	var result = testSubject.Run(stateBag)
+	var result = testSubject.Run(context.Background(), stateBag)
 
 	if result != multistep.ActionContinue {
 		t.Fatalf("Expected the step to return 'ActionContinue', but got '%d'.", result)
 	}
 
-	var expectedDeploymentName = stateBag.Get(constants.ArmDeploymentName).(string)
 	var expectedResourceGroupName = stateBag.Get(constants.ArmResourceGroupName).(string)
-	var expectedTemplateParameters = stateBag.Get(constants.ArmTemplateParameters).(*TemplateParameters)
 
-	if actualDeploymentName != expectedDeploymentName {
-		t.Fatalf("Expected StepValidateTemplate to source 'constants.ArmDeploymentName' from the state bag, but it did not.")
+	if actualDeploymentName != "--deployment-name--" {
+		t.Fatal("Expected StepValidateTemplate to source 'constants.ArmDeploymentName' from the state bag, but it did not.")
 	}
 
 	if actualResourceGroupName != expectedResourceGroupName {
-		t.Fatalf("Expected the step to source 'constants.ArmResourceGroupName' from the state bag, but it did not.")
+		t.Fatal("Expected the step to source 'constants.ArmResourceGroupName' from the state bag, but it did not.")
 	}
+}
 
-	if actualTemplateParameters != expectedTemplateParameters {
-		t.Fatalf("Expected the step to source 'constants.ArmTemplateParameters' from the state bag, but it did not.")
+func TestStepDeployTemplateDeleteImageShouldFailWhenImageUrlCannotBeParsed(t *testing.T) {
+	var testSubject = &StepDeployTemplate{
+		say:   func(message string) {},
+		error: func(e error) {},
+		name:  "--deployment-name--",
+	}
+	// Invalid URL per https://golang.org/src/net/url/url_test.go
+	err := testSubject.deleteImage(context.TODO(), "image", "http://[fe80::1%en0]/", "Unit Test: ResourceGroupName")
+	if err == nil {
+		t.Fatal("Expected a failure because of the failed image name")
+	}
+}
+
+func TestStepDeployTemplateDeleteImageShouldFailWithInvalidImage(t *testing.T) {
+	var testSubject = &StepDeployTemplate{
+		say:   func(message string) {},
+		error: func(e error) {},
+		name:  "--deployment-name--",
+	}
+	err := testSubject.deleteImage(context.TODO(), "image", "storage.blob.core.windows.net/abc", "Unit Test: ResourceGroupName")
+	if err == nil {
+		t.Fatal("Expected a failure because of the failed image name")
 	}
 }
 
@@ -95,7 +113,6 @@ func createTestStateBagStepDeployTemplate() multistep.StateBag {
 
 	stateBag.Put(constants.ArmDeploymentName, "Unit Test: DeploymentName")
 	stateBag.Put(constants.ArmResourceGroupName, "Unit Test: ResourceGroupName")
-	stateBag.Put(constants.ArmTemplateParameters, &TemplateParameters{})
 
 	return stateBag
 }

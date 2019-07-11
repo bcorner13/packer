@@ -1,15 +1,16 @@
 package qemu
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"path/filepath"
-	"strconv"
 	"strings"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/packer"
-	"github.com/mitchellh/packer/template/interpolate"
+	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/packer/helper/multistep"
+	"github.com/hashicorp/packer/packer"
+	"github.com/hashicorp/packer/template/interpolate"
 )
 
 // stepRun runs the virtual machine
@@ -20,14 +21,14 @@ type stepRun struct {
 
 type qemuArgsTemplateData struct {
 	HTTPIP      string
-	HTTPPort    uint
+	HTTPPort    int
 	HTTPDir     string
 	OutputDir   string
 	Name        string
-	SSHHostPort uint
+	SSHHostPort int
 }
 
-func (s *stepRun) Run(state multistep.StateBag) multistep.StepAction {
+func (s *stepRun) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
 	driver := state.Get("driver").(Driver)
 	ui := state.Get("ui").(packer.Ui)
 
@@ -35,7 +36,7 @@ func (s *stepRun) Run(state multistep.StateBag) multistep.StepAction {
 
 	command, err := getCommandArgs(s.BootDrive, state)
 	if err != nil {
-		err := fmt.Errorf("Error processing QemuArggs: %s", err)
+		err := fmt.Errorf("Error processing QemuArgs: %s", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
 	}
@@ -61,51 +62,102 @@ func (s *stepRun) Cleanup(state multistep.StateBag) {
 func getCommandArgs(bootDrive string, state multistep.StateBag) ([]string, error) {
 	config := state.Get("config").(*Config)
 	isoPath := state.Get("iso_path").(string)
-	vncPort := state.Get("vnc_port").(uint)
-	sshHostPort := state.Get("sshHostPort").(uint)
+	vncIP := state.Get("vnc_ip").(string)
+	vncPort := state.Get("vnc_port").(int)
 	ui := state.Get("ui").(packer.Ui)
 	driver := state.Get("driver").(Driver)
 
-	vnc := fmt.Sprintf("0.0.0.0:%d", vncPort-5900)
+	vnc := fmt.Sprintf("%s:%d", vncIP, vncPort-5900)
 	vmName := config.VMName
 	imgPath := filepath.Join(config.OutputDir, vmName)
 
 	defaultArgs := make(map[string]interface{})
 	var deviceArgs []string
 	var driveArgs []string
+	var sshHostPort int
 
 	defaultArgs["-name"] = vmName
 	defaultArgs["-machine"] = fmt.Sprintf("type=%s", config.MachineType)
-	defaultArgs["-netdev"] = fmt.Sprintf("user,id=user.0,hostfwd=tcp::%v-:%d", sshHostPort, config.Comm.Port())
+	if config.Comm.Type != "none" {
+		sshHostPort = state.Get("sshHostPort").(int)
+		defaultArgs["-netdev"] = fmt.Sprintf("user,id=user.0,hostfwd=tcp::%v-:%d", sshHostPort, config.Comm.Port())
+	} else {
+		defaultArgs["-netdev"] = fmt.Sprintf("user,id=user.0")
+	}
 
-	qemuVersion, err := driver.Version()
+	rawVersion, err := driver.Version()
 	if err != nil {
 		return nil, err
 	}
-	parts := strings.Split(qemuVersion, ".")
-	qemuMajor, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return nil, err
-	}
-	if qemuMajor >= 2 {
+	qemuVersion, err := version.NewVersion(rawVersion)
+	v2 := version.Must(version.NewVersion("2.0"))
+
+	if qemuVersion.GreaterThanOrEqual(v2) {
 		if config.DiskInterface == "virtio-scsi" {
-			deviceArgs = append(deviceArgs, "virtio-scsi-pci,id=scsi0", "scsi-hd,bus=scsi0.0,drive=drive0")
-			driveArgs = append(driveArgs, fmt.Sprintf("if=none,file=%s,id=drive0,cache=%s,discard=%s", imgPath, config.DiskCache, config.DiskDiscard))
+			if config.DiskImage {
+				deviceArgs = append(deviceArgs, "virtio-scsi-pci,id=scsi0", "scsi-hd,bus=scsi0.0,drive=drive0")
+				driveArgumentString := fmt.Sprintf("if=none,file=%s,id=drive0,cache=%s,discard=%s,format=%s", imgPath, config.DiskCache, config.DiskDiscard, config.Format)
+				if config.DetectZeroes != "off" {
+					driveArgumentString = fmt.Sprintf("%s,detect-zeroes=%s", driveArgumentString, config.DetectZeroes)
+				}
+				driveArgs = append(driveArgs, driveArgumentString)
+			} else {
+				deviceArgs = append(deviceArgs, "virtio-scsi-pci,id=scsi0")
+				diskFullPaths := state.Get("qemu_disk_paths").([]string)
+				for i, diskFullPath := range diskFullPaths {
+					deviceArgs = append(deviceArgs, fmt.Sprintf("scsi-hd,bus=scsi0.0,drive=drive%d", i))
+					driveArgumentString := fmt.Sprintf("if=none,file=%s,id=drive%d,cache=%s,discard=%s,format=%s", diskFullPath, i, config.DiskCache, config.DiskDiscard, config.Format)
+					if config.DetectZeroes != "off" {
+						driveArgumentString = fmt.Sprintf("%s,detect-zeroes=%s", driveArgumentString, config.DetectZeroes)
+					}
+					driveArgs = append(driveArgs, driveArgumentString)
+				}
+			}
 		} else {
-			driveArgs = append(driveArgs, fmt.Sprintf("file=%s,if=%s,cache=%s,discard=%s", imgPath, config.DiskInterface, config.DiskCache, config.DiskDiscard))
+			if config.DiskImage {
+				driveArgumentString := fmt.Sprintf("file=%s,if=%s,cache=%s,discard=%s,format=%s", imgPath, config.DiskInterface, config.DiskCache, config.DiskDiscard, config.Format)
+				if config.DetectZeroes != "off" {
+					driveArgumentString = fmt.Sprintf("%s,detect-zeroes=%s", driveArgumentString, config.DetectZeroes)
+				}
+				driveArgs = append(driveArgs, driveArgumentString)
+			} else {
+				diskFullPaths := state.Get("qemu_disk_paths").([]string)
+				for _, diskFullPath := range diskFullPaths {
+					driveArgumentString := fmt.Sprintf("file=%s,if=%s,cache=%s,discard=%s,format=%s", diskFullPath, config.DiskInterface, config.DiskCache, config.DiskDiscard, config.Format)
+					if config.DetectZeroes != "off" {
+						driveArgumentString = fmt.Sprintf("%s,detect-zeroes=%s", driveArgumentString, config.DetectZeroes)
+					}
+					driveArgs = append(driveArgs, driveArgumentString)
+				}
+			}
 		}
 	} else {
-		driveArgs = append(driveArgs, fmt.Sprintf("file=%s,if=%s,cache=%s", imgPath, config.DiskInterface, config.DiskCache))
+		driveArgs = append(driveArgs, fmt.Sprintf("file=%s,if=%s,cache=%s,format=%s", imgPath, config.DiskInterface, config.DiskCache, config.Format))
 	}
 	deviceArgs = append(deviceArgs, fmt.Sprintf("%s,netdev=user.0", config.NetDevice))
 
 	if config.Headless == true {
-		ui.Message("WARNING: The VM will be started in headless mode, as configured.\n" +
-			"In headless mode, errors during the boot sequence or OS setup\n" +
-			"won't be easily visible. Use at your own discretion.")
+		vncIpRaw, vncIpOk := state.GetOk("vnc_ip")
+		vncPortRaw, vncPortOk := state.GetOk("vnc_port")
+
+		if vncIpOk && vncPortOk {
+			vncIp := vncIpRaw.(string)
+			vncPort := vncPortRaw.(int)
+
+			ui.Message(fmt.Sprintf(
+				"The VM will be run headless, without a GUI. If you want to\n"+
+					"view the screen of the VM, connect via VNC without a password to\n"+
+					"vnc://%s:%d", vncIp, vncPort))
+		} else {
+			ui.Message("The VM will be run headless, without a GUI, as configured.\n" +
+				"If the run isn't succeeding as you expect, please enable the GUI\n" +
+				"to inspect the progress of the build.")
+		}
 	} else {
-		if qemuMajor >= 2 {
-			defaultArgs["-display"] = "sdl"
+		if qemuVersion.GreaterThanOrEqual(v2) {
+			if !config.UseDefaultDisplay {
+				defaultArgs["-display"] = "sdl"
+			}
 		} else {
 			ui.Message("WARNING: The version of qemu  on your host doesn't support display mode.\n" +
 				"The display parameter will be ignored.")
@@ -119,7 +171,10 @@ func getCommandArgs(bootDrive string, state multistep.StateBag) ([]string, error
 		defaultArgs["-cdrom"] = isoPath
 	}
 	defaultArgs["-boot"] = bootDrive
-	defaultArgs["-m"] = "512M"
+	defaultArgs["-m"] = fmt.Sprintf("%dM", config.MemorySize)
+	if config.CpuCount > 1 {
+		defaultArgs["-smp"] = fmt.Sprintf("cpus=%d,sockets=%d", config.CpuCount, config.CpuCount)
+	}
 	defaultArgs["-vnc"] = vnc
 
 	// Append the accelerator to the machine type if it is specified
@@ -141,17 +196,27 @@ func getCommandArgs(bootDrive string, state multistep.StateBag) ([]string, error
 	if len(config.QemuArgs) > 0 {
 		ui.Say("Overriding defaults Qemu arguments with QemuArgs...")
 
-		httpPort := state.Get("http_port").(uint)
-		ctx := config.ctx
-		ctx.Data = qemuArgsTemplateData{
-			"10.0.2.2",
-			httpPort,
-			config.HTTPDir,
-			config.OutputDir,
-			config.VMName,
-			sshHostPort,
+		httpPort := state.Get("http_port").(int)
+		ictx := config.ctx
+		if config.Comm.Type != "none" {
+			ictx.Data = qemuArgsTemplateData{
+				"10.0.2.2",
+				httpPort,
+				config.HTTPDir,
+				config.OutputDir,
+				config.VMName,
+				sshHostPort,
+			}
+		} else {
+			ictx.Data = qemuArgsTemplateData{
+				HTTPIP:    "10.0.2.2",
+				HTTPPort:  httpPort,
+				HTTPDir:   config.HTTPDir,
+				OutputDir: config.OutputDir,
+				Name:      config.VMName,
+			}
 		}
-		newQemuArgs, err := processArgs(config.QemuArgs, &ctx)
+		newQemuArgs, err := processArgs(config.QemuArgs, &ictx)
 		if err != nil {
 			return nil, err
 		}
@@ -182,6 +247,13 @@ func getCommandArgs(bootDrive string, state multistep.StateBag) ([]string, error
 				arg = defaultArgs[key].([]string)
 			}
 			inArgs[key] = arg
+		}
+	}
+
+	// Check if we are missing the netDevice #6804
+	if x, ok := inArgs["-device"]; ok {
+		if !strings.Contains(strings.Join(x, ""), config.NetDevice) {
+			inArgs["-device"] = append(inArgs["-device"], fmt.Sprintf("%s,netdev=user.0", config.NetDevice))
 		}
 	}
 

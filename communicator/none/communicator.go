@@ -1,10 +1,12 @@
 package none
 
 import (
+	"context"
 	"errors"
-	"github.com/mitchellh/packer/packer"
 	"io"
 	"os"
+
+	"github.com/hashicorp/packer/packer"
 )
 
 type comm struct {
@@ -22,7 +24,7 @@ func New(config string) (result *comm, err error) {
 	return
 }
 
-func (c *comm) Start(cmd *packer.RemoteCmd) (err error) {
+func (c *comm) Start(ctx context.Context, cmd *packer.RemoteCmd) (err error) {
 	cmd.SetExited(0)
 	return
 }
@@ -37,4 +39,8 @@ func (c *comm) UploadDir(dst string, src string, excl []string) error {
 
 func (c *comm) Download(path string, output io.Writer) error {
 	return errors.New("Download is not implemented when communicator = 'none'")
+}
+
+func (c *comm) DownloadDir(dst string, src string, excl []string) error {
+	return errors.New("DownloadDir is not implemented when communicator = 'none'")
 }

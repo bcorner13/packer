@@ -1,27 +1,24 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License. See the LICENSE file in builder/azure for license information.
-
 package arm
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
-	"github.com/mitchellh/multistep"
-	"github.com/mitchellh/packer/builder/azure/common/constants"
+	"github.com/hashicorp/packer/builder/azure/common/constants"
+	"github.com/hashicorp/packer/helper/multistep"
 )
 
 func TestStepValidateTemplateShouldFailIfValidateFails(t *testing.T) {
-
 	var testSubject = &StepValidateTemplate{
-		validate: func(string, string, *TemplateParameters) error { return fmt.Errorf("!! Unit Test FAIL !!") },
+		validate: func(context.Context, string, string) error { return fmt.Errorf("!! Unit Test FAIL !!") },
 		say:      func(message string) {},
 		error:    func(e error) {},
 	}
 
 	stateBag := createTestStateBagStepValidateTemplate()
 
-	var result = testSubject.Run(stateBag)
+	var result = testSubject.Run(context.Background(), stateBag)
 	if result != multistep.ActionHalt {
 		t.Fatalf("Expected the step to return 'ActionHalt', but got '%d'.", result)
 	}
@@ -33,14 +30,14 @@ func TestStepValidateTemplateShouldFailIfValidateFails(t *testing.T) {
 
 func TestStepValidateTemplateShouldPassIfValidatePasses(t *testing.T) {
 	var testSubject = &StepValidateTemplate{
-		validate: func(string, string, *TemplateParameters) error { return nil },
+		validate: func(context.Context, string, string) error { return nil },
 		say:      func(message string) {},
 		error:    func(e error) {},
 	}
 
 	stateBag := createTestStateBagStepValidateTemplate()
 
-	var result = testSubject.Run(stateBag)
+	var result = testSubject.Run(context.Background(), stateBag)
 	if result != multistep.ActionContinue {
 		t.Fatalf("Expected the step to return 'ActionContinue', but got '%d'.", result)
 	}
@@ -53,13 +50,11 @@ func TestStepValidateTemplateShouldPassIfValidatePasses(t *testing.T) {
 func TestStepValidateTemplateShouldTakeStepArgumentsFromStateBag(t *testing.T) {
 	var actualResourceGroupName string
 	var actualDeploymentName string
-	var actualTemplateParameters *TemplateParameters
 
 	var testSubject = &StepValidateTemplate{
-		validate: func(resourceGroupName string, deploymentName string, templateParameter *TemplateParameters) error {
+		validate: func(ctx context.Context, resourceGroupName string, deploymentName string) error {
 			actualResourceGroupName = resourceGroupName
 			actualDeploymentName = deploymentName
-			actualTemplateParameters = templateParameter
 
 			return nil
 		},
@@ -68,7 +63,7 @@ func TestStepValidateTemplateShouldTakeStepArgumentsFromStateBag(t *testing.T) {
 	}
 
 	stateBag := createTestStateBagStepValidateTemplate()
-	var result = testSubject.Run(stateBag)
+	var result = testSubject.Run(context.Background(), stateBag)
 
 	if result != multistep.ActionContinue {
 		t.Fatalf("Expected the step to return 'ActionContinue', but got '%d'.", result)
@@ -76,18 +71,13 @@ func TestStepValidateTemplateShouldTakeStepArgumentsFromStateBag(t *testing.T) {
 
 	var expectedDeploymentName = stateBag.Get(constants.ArmDeploymentName).(string)
 	var expectedResourceGroupName = stateBag.Get(constants.ArmResourceGroupName).(string)
-	var expectedTemplateParameters = stateBag.Get(constants.ArmTemplateParameters).(*TemplateParameters)
 
 	if actualDeploymentName != expectedDeploymentName {
-		t.Fatalf("Expected the step to source 'constants.ArmDeploymentName' from the state bag, but it did not.")
+		t.Fatal("Expected the step to source 'constants.ArmDeploymentName' from the state bag, but it did not.")
 	}
 
 	if actualResourceGroupName != expectedResourceGroupName {
-		t.Fatalf("Expected the step to source 'constants.ArmResourceGroupName' from the state bag, but it did not.")
-	}
-
-	if actualTemplateParameters != expectedTemplateParameters {
-		t.Fatalf("Expected the step to source 'constants.ArmTemplateParameters' from the state bag, but it did not.")
+		t.Fatal("Expected the step to source 'constants.ArmResourceGroupName' from the state bag, but it did not.")
 	}
 }
 
@@ -96,7 +86,6 @@ func createTestStateBagStepValidateTemplate() multistep.StateBag {
 
 	stateBag.Put(constants.ArmDeploymentName, "Unit Test: DeploymentName")
 	stateBag.Put(constants.ArmResourceGroupName, "Unit Test: ResourceGroupName")
-	stateBag.Put(constants.ArmTemplateParameters, &TemplateParameters{})
 
 	return stateBag
 }

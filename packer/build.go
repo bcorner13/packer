@@ -1,6 +1,7 @@
 package packer
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -23,6 +24,12 @@ const (
 	// This is the key in configurations that is set to "true" when Packer
 	// force build is enabled.
 	ForceConfigKey = "packer_force"
+
+	// This key determines what to do when a normal multistep step fails
+	// - "cleanup" - run cleanup steps
+	// - "abort" - exit without cleanup
+	// - "ask" - ask the user
+	OnErrorConfigKey = "packer_on_error"
 
 	// TemplatePathKey is the path to the template that configured this build
 	TemplatePathKey = "packer_template_path"
@@ -47,11 +54,8 @@ type Build interface {
 
 	// Run runs the actual builder, returning an artifact implementation
 	// of what is built. If anything goes wrong, an error is returned.
-	Run(Ui, Cache) ([]Artifact, error)
-
-	// Cancel will cancel a running build. This will block until the build
-	// is actually completely cancelled.
-	Cancel()
+	// Run can be context cancelled.
+	Run(context.Context, Ui) ([]Artifact, error)
 
 	// SetDebug will enable/disable debug mode. Debug mode is always
 	// enabled by adding the additional key "packer_debug" to boolean
@@ -67,6 +71,12 @@ type Build interface {
 	// When SetForce is set to true, existing artifacts from the build are
 	// deleted prior to the build.
 	SetForce(bool)
+
+	// SetOnError will determine what to do when a normal multistep step fails
+	// - "cleanup" - run cleanup steps
+	// - "abort" - exit without cleanup
+	// - "ask" - ask the user
+	SetOnError(string)
 }
 
 // A build struct represents a single build job, the result of which should
@@ -86,6 +96,7 @@ type coreBuild struct {
 
 	debug         bool
 	force         bool
+	onError       string
 	l             sync.Mutex
 	prepareCalled bool
 }
@@ -96,12 +107,13 @@ type coreBuildPostProcessor struct {
 	processor         PostProcessor
 	processorType     string
 	config            map[string]interface{}
-	keepInputArtifact bool
+	keepInputArtifact *bool
 }
 
 // Keeps track of the provisioner and the configuration of the provisioner
 // within the build.
 type coreBuildProvisioner struct {
+	pType       string
 	provisioner Provisioner
 	config      []interface{}
 }
@@ -129,6 +141,7 @@ func (b *coreBuild) Prepare() (warn []string, err error) {
 		BuilderTypeConfigKey:   b.builderType,
 		DebugConfigKey:         b.debug,
 		ForceConfigKey:         b.force,
+		OnErrorConfigKey:       b.onError,
 		TemplatePathKey:        b.templatePath,
 		UserVariablesConfigKey: b.variables,
 	}
@@ -165,7 +178,7 @@ func (b *coreBuild) Prepare() (warn []string, err error) {
 }
 
 // Runs the actual build. Prepare must be called prior to running this.
-func (b *coreBuild) Run(originalUi Ui, cache Cache) ([]Artifact, error) {
+func (b *coreBuild) Run(ctx context.Context, originalUi Ui) ([]Artifact, error) {
 	if !b.prepareCalled {
 		panic("Prepare must be called first")
 	}
@@ -179,9 +192,25 @@ func (b *coreBuild) Run(originalUi Ui, cache Cache) ([]Artifact, error) {
 
 	// Add a hook for the provisioners if we have provisioners
 	if len(b.provisioners) > 0 {
-		provisioners := make([]Provisioner, len(b.provisioners))
+		hookedProvisioners := make([]*HookedProvisioner, len(b.provisioners))
 		for i, p := range b.provisioners {
-			provisioners[i] = p.provisioner
+			var pConfig interface{}
+			if len(p.config) > 0 {
+				pConfig = p.config[0]
+			}
+			if b.debug {
+				hookedProvisioners[i] = &HookedProvisioner{
+					&DebuggedProvisioner{Provisioner: p.provisioner},
+					pConfig,
+					p.pType,
+				}
+			} else {
+				hookedProvisioners[i] = &HookedProvisioner{
+					p.provisioner,
+					pConfig,
+					p.pType,
+				}
+			}
 		}
 
 		if _, ok := hooks[HookProvision]; !ok {
@@ -189,21 +218,23 @@ func (b *coreBuild) Run(originalUi Ui, cache Cache) ([]Artifact, error) {
 		}
 
 		hooks[HookProvision] = append(hooks[HookProvision], &ProvisionHook{
-			Provisioners: provisioners,
+			Provisioners: hookedProvisioners,
 		})
 	}
 
 	hook := &DispatchHook{Mapping: hooks}
 	artifacts := make([]Artifact, 0, 1)
 
-	// The builder just has a normal Ui, but targetted
-	builderUi := &TargettedUi{
+	// The builder just has a normal Ui, but targeted
+	builderUi := &TargetedUI{
 		Target: b.Name(),
 		Ui:     originalUi,
 	}
 
 	log.Printf("Running builder: %s", b.builderType)
-	builderArtifact, err := b.builder.Run(builderUi, hook, cache)
+	ts := CheckpointReporter.AddSpan(b.builderType, "builder", b.builderConfig)
+	builderArtifact, err := b.builder.Run(ctx, builderUi, hook)
+	ts.End(err)
 	if err != nil {
 		return nil, err
 	}
@@ -222,13 +253,15 @@ PostProcessorRunSeqLoop:
 	for _, ppSeq := range b.postProcessors {
 		priorArtifact := builderArtifact
 		for i, corePP := range ppSeq {
-			ppUi := &TargettedUi{
+			ppUi := &TargetedUI{
 				Target: fmt.Sprintf("%s (%s)", b.Name(), corePP.processorType),
 				Ui:     originalUi,
 			}
 
 			builderUi.Say(fmt.Sprintf("Running post-processor: %s", corePP.processorType))
-			artifact, keep, err := corePP.processor.PostProcess(ppUi, priorArtifact)
+			ts := CheckpointReporter.AddSpan(corePP.processorType, "post-processor", corePP.config)
+			artifact, defaultKeep, forceOverride, err := corePP.processor.PostProcess(ctx, ppUi, priorArtifact)
+			ts.End(err)
 			if err != nil {
 				errors = append(errors, fmt.Errorf("Post-processor failed: %s", err))
 				continue PostProcessorRunSeqLoop
@@ -239,7 +272,25 @@ PostProcessorRunSeqLoop:
 				continue PostProcessorRunSeqLoop
 			}
 
-			keep = keep || corePP.keepInputArtifact
+			keep := defaultKeep
+			// When user has not set keep_input_artifuact
+			// corePP.keepInputArtifact is nil.
+			// In this case, use the keepDefault provided by the postprocessor.
+			// When user _has_ set keep_input_atifact, go with that instead.
+			// Exception: for postprocessors that will fail/become
+			// useless if keep isn't true, heed forceOverride and keep the
+			// input artifact regardless of user preference.
+			if corePP.keepInputArtifact != nil {
+				if defaultKeep && *corePP.keepInputArtifact == false && forceOverride {
+					log.Printf("The %s post-processor forces "+
+						"keep_input_artifact=true to preserve integrity of the"+
+						"build chain. User-set keep_input_artifact=false will be"+
+						"ignored.", corePP.processorType)
+				} else {
+					// User overrides default.
+					keep = *corePP.keepInputArtifact
+				}
+			}
 			if i == 0 {
 				// This is the first post-processor. We handle deleting
 				// previous artifacts a bit different because multiple
@@ -258,7 +309,8 @@ PostProcessorRunSeqLoop:
 				} else {
 					log.Printf("Deleting prior artifact from post-processor '%s'", corePP.processorType)
 					if err := priorArtifact.Destroy(); err != nil {
-						errors = append(errors, fmt.Errorf("Failed cleaning up prior artifact: %s", err))
+						log.Printf("Error is %#v", err)
+						errors = append(errors, fmt.Errorf("Failed cleaning up prior artifact: %s; pp is %s", err, corePP.processorType))
 					}
 				}
 			}
@@ -279,7 +331,7 @@ PostProcessorRunSeqLoop:
 	} else {
 		log.Printf("Deleting original artifact for build '%s'", b.name)
 		if err := builderArtifact.Destroy(); err != nil {
-			errors = append(errors, fmt.Errorf("Error destroying builder artifact: %s", err))
+			errors = append(errors, fmt.Errorf("Error destroying builder artifact: %s; bad artifact: %#v", err, builderArtifact.Files()))
 		}
 	}
 
@@ -306,7 +358,10 @@ func (b *coreBuild) SetForce(val bool) {
 	b.force = val
 }
 
-// Cancels the build if it is running.
-func (b *coreBuild) Cancel() {
-	b.builder.Cancel()
+func (b *coreBuild) SetOnError(val string) {
+	if b.prepareCalled {
+		panic("prepare has already been called")
+	}
+
+	b.onError = val
 }
